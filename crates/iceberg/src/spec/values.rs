@@ -20,6 +20,7 @@
  */
 
 use std::any::Any;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 use std::fmt::{Display, Formatter};
 use std::hash::Hash;
@@ -27,10 +28,11 @@ use std::ops::Index;
 use std::str::FromStr;
 
 pub use _serde::RawLiteral;
-use bitvec::vec::BitVec;
 use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime, TimeZone, Utc};
-use ordered_float::OrderedFloat;
+use num_bigint::BigInt;
+use ordered_float::{Float, OrderedFloat};
 use rust_decimal::Decimal;
+use rust_decimal::prelude::ToPrimitive;
 use serde::de::{
     MapAccess, {self},
 };
@@ -43,18 +45,23 @@ use uuid::Uuid;
 
 use super::datatypes::{PrimitiveType, Type};
 use crate::error::Result;
+use crate::spec::MAX_DECIMAL_PRECISION;
 use crate::spec::values::date::{date_from_naive_date, days_to_date, unix_epoch};
 use crate::spec::values::time::microseconds_to_time;
 use crate::spec::values::timestamp::microseconds_to_datetime;
 use crate::spec::values::timestamptz::{microseconds_to_datetimetz, nanoseconds_to_datetimetz};
-use crate::spec::MAX_DECIMAL_PRECISION;
-use crate::{ensure_data_valid, Error, ErrorKind};
+use crate::{Error, ErrorKind, ensure_data_valid};
 
 /// Maximum value for [`PrimitiveType::Time`] type in microseconds, e.g. 23 hours 59 minutes 59 seconds 999999 microseconds.
 const MAX_TIME_VALUE: i64 = 24 * 60 * 60 * 1_000_000i64 - 1;
 
+const INT_MAX: i32 = 2147483647;
+const INT_MIN: i32 = -2147483648;
+const LONG_MAX: i64 = 9223372036854775807;
+const LONG_MIN: i64 = -9223372036854775808;
+
 /// Values present in iceberg type
-#[derive(Clone, Debug, PartialEq, Hash, Eq)]
+#[derive(Clone, Debug, PartialOrd, PartialEq, Hash, Eq)]
 pub enum PrimitiveLiteral {
     /// 0x00 for false, non-zero byte for true
     Boolean(bool),
@@ -74,6 +81,10 @@ pub enum PrimitiveLiteral {
     Int128(i128),
     /// Stored as 16-byte little-endian
     UInt128(u128),
+    /// When a number is larger than it can hold
+    AboveMax,
+    /// When a number is smaller than it can hold
+    BelowMin,
 }
 
 impl PrimitiveLiteral {
@@ -204,6 +215,36 @@ impl<'de> Deserialize<'de> for Datum {
     }
 }
 
+// Compare following iceberg float ordering rules:
+//  -NaN < -Infinity < -value < -0 < 0 < value < Infinity < NaN
+fn iceberg_float_cmp<T: Float>(a: T, b: T) -> Option<Ordering> {
+    if a.is_nan() && b.is_nan() {
+        return match (a.is_sign_negative(), b.is_sign_negative()) {
+            (true, false) => Some(Ordering::Less),
+            (false, true) => Some(Ordering::Greater),
+            _ => Some(Ordering::Equal),
+        };
+    }
+
+    if a.is_nan() {
+        return Some(if a.is_sign_negative() {
+            Ordering::Less
+        } else {
+            Ordering::Greater
+        });
+    }
+
+    if b.is_nan() {
+        return Some(if b.is_sign_negative() {
+            Ordering::Greater
+        } else {
+            Ordering::Less
+        });
+    }
+
+    a.partial_cmp(&b)
+}
+
 impl PartialOrd for Datum {
     fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
         match (&self.literal, &other.literal, &self.r#type, &other.r#type) {
@@ -231,13 +272,13 @@ impl PartialOrd for Datum {
                 PrimitiveLiteral::Float(other_val),
                 PrimitiveType::Float,
                 PrimitiveType::Float,
-            ) => val.partial_cmp(other_val),
+            ) => iceberg_float_cmp(*val, *other_val),
             (
                 PrimitiveLiteral::Double(val),
                 PrimitiveLiteral::Double(other_val),
                 PrimitiveType::Double,
                 PrimitiveType::Double,
-            ) => val.partial_cmp(other_val),
+            ) => iceberg_float_cmp(*val, *other_val),
             (
                 PrimitiveLiteral::Int(val),
                 PrimitiveLiteral::Int(other_val),
@@ -310,11 +351,11 @@ impl PartialOrd for Datum {
 impl Display for Datum {
     fn fmt(&self, f: &mut Formatter<'_>) -> std::fmt::Result {
         match (&self.r#type, &self.literal) {
-            (_, PrimitiveLiteral::Boolean(val)) => write!(f, "{}", val),
-            (PrimitiveType::Int, PrimitiveLiteral::Int(val)) => write!(f, "{}", val),
-            (PrimitiveType::Long, PrimitiveLiteral::Long(val)) => write!(f, "{}", val),
-            (_, PrimitiveLiteral::Float(val)) => write!(f, "{}", val),
-            (_, PrimitiveLiteral::Double(val)) => write!(f, "{}", val),
+            (_, PrimitiveLiteral::Boolean(val)) => write!(f, "{val}"),
+            (PrimitiveType::Int, PrimitiveLiteral::Int(val)) => write!(f, "{val}"),
+            (PrimitiveType::Long, PrimitiveLiteral::Long(val)) => write!(f, "{val}"),
+            (_, PrimitiveLiteral::Float(val)) => write!(f, "{val}"),
+            (_, PrimitiveLiteral::Double(val)) => write!(f, "{val}"),
             (PrimitiveType::Date, PrimitiveLiteral::Int(val)) => {
                 write!(f, "{}", days_to_date(*val))
             }
@@ -333,7 +374,7 @@ impl Display for Datum {
             (PrimitiveType::TimestamptzNs, PrimitiveLiteral::Long(val)) => {
                 write!(f, "{}", nanoseconds_to_datetimetz(*val))
             }
-            (_, PrimitiveLiteral::String(val)) => write!(f, r#""{}""#, val),
+            (_, PrimitiveLiteral::String(val)) => write!(f, r#""{val}""#),
             (PrimitiveType::Uuid, PrimitiveLiteral::UInt128(val)) => {
                 write!(f, "{}", Uuid::from_u128(*val))
             }
@@ -357,7 +398,7 @@ impl Display for Datum {
 fn display_bytes(bytes: &[u8], f: &mut Formatter<'_>) -> std::fmt::Result {
     let mut s = String::with_capacity(bytes.len() * 2);
     for b in bytes {
-        s.push_str(&format!("{:02X}", b));
+        s.push_str(&format!("{b:02X}"));
     }
     f.write_str(&s)
 }
@@ -393,12 +434,26 @@ impl Datum {
                 }
             }
             PrimitiveType::Int => PrimitiveLiteral::Int(i32::from_le_bytes(bytes.try_into()?)),
-            PrimitiveType::Long => PrimitiveLiteral::Long(i64::from_le_bytes(bytes.try_into()?)),
+            PrimitiveType::Long => {
+                if bytes.len() == 4 {
+                    // In the case of an evolved field
+                    PrimitiveLiteral::Long(i32::from_le_bytes(bytes.try_into()?) as i64)
+                } else {
+                    PrimitiveLiteral::Long(i64::from_le_bytes(bytes.try_into()?))
+                }
+            }
             PrimitiveType::Float => {
                 PrimitiveLiteral::Float(OrderedFloat(f32::from_le_bytes(bytes.try_into()?)))
             }
             PrimitiveType::Double => {
-                PrimitiveLiteral::Double(OrderedFloat(f64::from_le_bytes(bytes.try_into()?)))
+                if bytes.len() == 4 {
+                    // In the case of an evolved field
+                    PrimitiveLiteral::Double(OrderedFloat(
+                        f32::from_le_bytes(bytes.try_into()?) as f64
+                    ))
+                } else {
+                    PrimitiveLiteral::Double(OrderedFloat(f64::from_le_bytes(bytes.try_into()?)))
+                }
             }
             PrimitiveType::Date => PrimitiveLiteral::Int(i32::from_le_bytes(bytes.try_into()?)),
             PrimitiveType::Time => PrimitiveLiteral::Long(i64::from_le_bytes(bytes.try_into()?)),
@@ -422,10 +477,15 @@ impl Datum {
             }
             PrimitiveType::Fixed(_) => PrimitiveLiteral::Binary(Vec::from(bytes)),
             PrimitiveType::Binary => PrimitiveLiteral::Binary(Vec::from(bytes)),
-            PrimitiveType::Decimal {
-                precision: _,
-                scale: _,
-            } => todo!(),
+            PrimitiveType::Decimal { .. } => {
+                let unscaled_value = BigInt::from_signed_bytes_be(bytes);
+                PrimitiveLiteral::Int128(unscaled_value.to_i128().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Can't convert bytes to i128: {bytes:?}"),
+                    )
+                })?)
+            }
         };
         Ok(Datum::new(data_type, literal))
     }
@@ -433,8 +493,8 @@ impl Datum {
     /// Convert the value to bytes
     ///
     /// See [this spec](https://iceberg.apache.org/spec/#binary-single-value-serialization) for reference.
-    pub fn to_bytes(&self) -> ByteBuf {
-        match &self.literal {
+    pub fn to_bytes(&self) -> Result<ByteBuf> {
+        let buf = match &self.literal {
             PrimitiveLiteral::Boolean(val) => {
                 if *val {
                     ByteBuf::from([1u8])
@@ -449,8 +509,47 @@ impl Datum {
             PrimitiveLiteral::String(val) => ByteBuf::from(val.as_bytes()),
             PrimitiveLiteral::UInt128(val) => ByteBuf::from(val.to_be_bytes()),
             PrimitiveLiteral::Binary(val) => ByteBuf::from(val.as_slice()),
-            PrimitiveLiteral::Int128(_) => todo!(),
-        }
+            PrimitiveLiteral::Int128(val) => {
+                let PrimitiveType::Decimal { precision, .. } = self.r#type else {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "PrimitiveLiteral Int128 must be PrimitiveType Decimal but got {}",
+                            &self.r#type
+                        ),
+                    ));
+                };
+
+                // It's required by iceberg spec that we must keep the minimum
+                // number of bytes for the value
+                let Ok(required_bytes) = Type::decimal_required_bytes(precision) else {
+                    return Err(Error::new(
+                        ErrorKind::DataInvalid,
+                        format!(
+                            "PrimitiveType Decimal must has valid precision but got {precision}"
+                        ),
+                    ));
+                };
+
+                // The primitive literal is unscaled value.
+                let unscaled_value = BigInt::from(*val);
+                // Convert into two's-complement byte representation of the BigInt
+                // in big-endian byte order.
+                let mut bytes = unscaled_value.to_signed_bytes_be();
+                // Truncate with required bytes to make sure.
+                bytes.truncate(required_bytes as usize);
+
+                ByteBuf::from(bytes)
+            }
+            PrimitiveLiteral::AboveMax | PrimitiveLiteral::BelowMin => {
+                return Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "Cannot convert AboveMax or BelowMin to bytes".to_string(),
+                ));
+            }
+        };
+
+        Ok(buf)
     }
 
     /// Creates a boolean value.
@@ -1012,6 +1111,79 @@ impl Datum {
         }
     }
 
+    /// Try to create a decimal literal from [`Decimal`] with precision.
+    ///
+    /// Example:
+    ///
+    /// ```rust
+    /// use iceberg::spec::Datum;
+    /// use rust_decimal::Decimal;
+    ///
+    /// let t = Datum::decimal_with_precision(Decimal::new(123, 2), 30).unwrap();
+    ///
+    /// assert_eq!(&format!("{t}"), "1.23");
+    /// ```
+    pub fn decimal_with_precision(value: impl Into<Decimal>, precision: u32) -> Result<Self> {
+        let decimal = value.into();
+        let scale = decimal.scale();
+
+        let available_bytes = Type::decimal_required_bytes(precision)? as usize;
+        let unscaled_value = BigInt::from(decimal.mantissa());
+        let actual_bytes = unscaled_value.to_signed_bytes_be();
+        if actual_bytes.len() > available_bytes {
+            return Err(Error::new(
+                ErrorKind::DataInvalid,
+                format!("Decimal value {decimal} is too large for precision {precision}"),
+            ));
+        }
+
+        let r#type = Type::decimal(precision, scale)?;
+        if let Type::Primitive(p) = r#type {
+            Ok(Self {
+                r#type: p,
+                literal: PrimitiveLiteral::Int128(decimal.mantissa()),
+            })
+        } else {
+            unreachable!("Decimal type must be primitive.")
+        }
+    }
+
+    fn i64_to_i32<T: Into<i64> + PartialOrd<i64>>(val: T) -> Datum {
+        if val > INT_MAX as i64 {
+            Datum::new(PrimitiveType::Int, PrimitiveLiteral::AboveMax)
+        } else if val < INT_MIN as i64 {
+            Datum::new(PrimitiveType::Int, PrimitiveLiteral::BelowMin)
+        } else {
+            Datum::int(val.into() as i32)
+        }
+    }
+
+    fn i128_to_i32<T: Into<i128> + PartialOrd<i128>>(val: T) -> Datum {
+        if val > INT_MAX as i128 {
+            Datum::new(PrimitiveType::Int, PrimitiveLiteral::AboveMax)
+        } else if val < INT_MIN as i128 {
+            Datum::new(PrimitiveType::Int, PrimitiveLiteral::BelowMin)
+        } else {
+            Datum::int(val.into() as i32)
+        }
+    }
+
+    fn i128_to_i64<T: Into<i128> + PartialOrd<i128>>(val: T) -> Datum {
+        if val > LONG_MAX as i128 {
+            Datum::new(PrimitiveType::Long, PrimitiveLiteral::AboveMax)
+        } else if val < LONG_MIN as i128 {
+            Datum::new(PrimitiveType::Long, PrimitiveLiteral::BelowMin)
+        } else {
+            Datum::long(val.into() as i64)
+        }
+    }
+
+    fn string_to_i128<S: AsRef<str>>(s: S) -> Result<i128> {
+        s.as_ref().parse::<i128>().map_err(|e| {
+            Error::new(ErrorKind::DataInvalid, "Can't parse string to i128.").with_source(e)
+        })
+    }
+
     /// Convert the datum to `target_type`.
     pub fn to(self, target_type: &Type) -> Result<Datum> {
         match target_type {
@@ -1019,6 +1191,37 @@ impl Datum {
                 match (&self.literal, &self.r#type, target_primitive_type) {
                     (PrimitiveLiteral::Int(val), _, PrimitiveType::Int) => Ok(Datum::int(*val)),
                     (PrimitiveLiteral::Int(val), _, PrimitiveType::Date) => Ok(Datum::date(*val)),
+                    (PrimitiveLiteral::Int(val), _, PrimitiveType::Long) => Ok(Datum::long(*val)),
+                    (PrimitiveLiteral::Long(val), _, PrimitiveType::Int) => {
+                        Ok(Datum::i64_to_i32(*val))
+                    }
+                    (PrimitiveLiteral::Long(val), _, PrimitiveType::Timestamp) => {
+                        Ok(Datum::timestamp_micros(*val))
+                    }
+                    (PrimitiveLiteral::Long(val), _, PrimitiveType::Timestamptz) => {
+                        Ok(Datum::timestamptz_micros(*val))
+                    }
+                    // Let's wait with nano's until this clears up: https://github.com/apache/iceberg/pull/11775
+                    (PrimitiveLiteral::Int128(val), _, PrimitiveType::Long) => {
+                        Ok(Datum::i128_to_i64(*val))
+                    }
+
+                    (PrimitiveLiteral::String(val), _, PrimitiveType::Boolean) => {
+                        Datum::bool_from_str(val)
+                    }
+                    (PrimitiveLiteral::String(val), _, PrimitiveType::Int) => {
+                        Datum::string_to_i128(val).map(Datum::i128_to_i32)
+                    }
+                    (PrimitiveLiteral::String(val), _, PrimitiveType::Long) => {
+                        Datum::string_to_i128(val).map(Datum::i128_to_i64)
+                    }
+                    (PrimitiveLiteral::String(val), _, PrimitiveType::Timestamp) => {
+                        Datum::timestamp_from_str(val)
+                    }
+                    (PrimitiveLiteral::String(val), _, PrimitiveType::Timestamptz) => {
+                        Datum::timestamptz_from_str(val)
+                    }
+
                     // TODO: implement more type conversions
                     (_, self_type, target_type) if self_type == target_type => Ok(self),
                     _ => Err(Error::new(
@@ -1059,12 +1262,39 @@ impl Datum {
             _ => false,
         }
     }
+
+    /// Returns a human-readable string representation of this literal.
+    ///
+    /// For string literals, this returns the raw string value without quotes.
+    /// For all other literals, it falls back to [`to_string()`].
+    pub fn to_human_string(&self) -> String {
+        match self.literal() {
+            PrimitiveLiteral::String(s) => s.to_string(),
+            _ => self.to_string(),
+        }
+    }
 }
 
 /// Map is a collection of key-value pairs with a key type and a value type.
 /// It used in Literal::Map, to make it hashable, the order of key-value pairs is stored in a separate vector
 /// so that we can hash the map in a deterministic way. But it also means that the order of key-value pairs is matter
 /// for the hash value.
+///
+/// When converting to Arrow (e.g., for Iceberg), the map should be represented using
+/// the default field name "key_value".
+///
+/// Example:
+///
+/// ```text
+/// let key_value_field = Field::new(
+///     DEFAULT_MAP_FIELD_NAME,
+///     arrow_schema::DataType::Struct(vec![
+///         Arc::new(key_field.clone()),
+///         Arc::new(value_field.clone()),
+///     ].into()),
+///     false
+/// );
+/// '''
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct Map {
     index: HashMap<Literal, usize>,
@@ -1401,6 +1631,16 @@ impl Literal {
         Self::Primitive(PrimitiveLiteral::Long(value))
     }
 
+    /// Creates a timestamp from unix epoch in nanoseconds.
+    pub(crate) fn timestamp_nano(value: i64) -> Self {
+        Self::Primitive(PrimitiveLiteral::Long(value))
+    }
+
+    /// Creates a timestamp with timezone from unix epoch in nanoseconds.
+    pub(crate) fn timestamptz_nano(value: i64) -> Self {
+        Self::Primitive(PrimitiveLiteral::Long(value))
+    }
+
     /// Creates a timestamp from [`DateTime`].
     pub fn timestamp_from_datetime<T: TimeZone>(dt: DateTime<T>) -> Self {
         Self::timestamp(dt.with_timezone(&Utc).timestamp_micros())
@@ -1553,36 +1793,28 @@ impl Literal {
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
 pub struct Struct {
     /// Vector to store the field values
-    fields: Vec<Literal>,
-    /// Null bitmap
-    null_bitmap: BitVec,
+    fields: Vec<Option<Literal>>,
 }
 
 impl Struct {
     /// Create a empty struct.
     pub fn empty() -> Self {
-        Self {
-            fields: Vec::new(),
-            null_bitmap: BitVec::new(),
-        }
+        Self { fields: Vec::new() }
     }
 
     /// Create a iterator to read the field in order of field_value.
     pub fn iter(&self) -> impl ExactSizeIterator<Item = Option<&Literal>> {
-        self.null_bitmap.iter().zip(self.fields.iter()).map(
-            |(null, value)| {
-                if *null {
-                    None
-                } else {
-                    Some(value)
-                }
-            },
-        )
+        self.fields.iter().map(|field| field.as_ref())
     }
 
     /// returns true if the field at position `index` is null
     pub fn is_null_at_index(&self, index: usize) -> bool {
-        self.null_bitmap[index]
+        self.fields[index].is_none()
+    }
+
+    /// Return fields in the struct.
+    pub fn fields(&self) -> &[Option<Literal>] {
+        &self.fields
     }
 
     /// Return fields in the struct.
@@ -1592,63 +1824,27 @@ impl Struct {
 }
 
 impl Index<usize> for Struct {
-    type Output = Literal;
+    type Output = Option<Literal>;
 
     fn index(&self, idx: usize) -> &Self::Output {
         &self.fields[idx]
     }
 }
 
-/// An iterator that moves out of a struct.
-pub struct StructValueIntoIter {
-    null_bitmap: bitvec::boxed::IntoIter,
-    fields: std::vec::IntoIter<Literal>,
-}
-
-impl Iterator for StructValueIntoIter {
-    type Item = Option<Literal>;
-
-    fn next(&mut self) -> Option<Self::Item> {
-        match (self.null_bitmap.next(), self.fields.next()) {
-            (Some(null), Some(value)) => Some(if null { None } else { Some(value) }),
-            _ => None,
-        }
-    }
-}
-
 impl IntoIterator for Struct {
     type Item = Option<Literal>;
 
-    type IntoIter = StructValueIntoIter;
+    type IntoIter = std::vec::IntoIter<Option<Literal>>;
 
     fn into_iter(self) -> Self::IntoIter {
-        StructValueIntoIter {
-            null_bitmap: self.null_bitmap.into_iter(),
-            fields: self.fields.into_iter(),
-        }
+        self.fields.into_iter()
     }
 }
 
 impl FromIterator<Option<Literal>> for Struct {
     fn from_iter<I: IntoIterator<Item = Option<Literal>>>(iter: I) -> Self {
-        let mut fields = Vec::new();
-        let mut null_bitmap = BitVec::new();
-
-        for value in iter.into_iter() {
-            match value {
-                Some(value) => {
-                    fields.push(value);
-                    null_bitmap.push(false)
-                }
-                None => {
-                    fields.push(Literal::Primitive(PrimitiveLiteral::Boolean(false)));
-                    null_bitmap.push(true)
-                }
-            }
-        }
         Struct {
-            fields,
-            null_bitmap,
+            fields: iter.into_iter().collect(),
         }
     }
 }
@@ -1697,6 +1893,17 @@ impl Literal {
                         date::date_to_days(&NaiveDate::parse_from_str(&s, "%Y-%m-%d")?),
                     ))))
                 }
+                (PrimitiveType::Date, JsonValue::Number(number)) => {
+                    Ok(Some(Literal::Primitive(PrimitiveLiteral::Int(
+                        number
+                            .as_i64()
+                            .ok_or(Error::new(
+                                crate::ErrorKind::DataInvalid,
+                                "Failed to convert json number to date (days since epoch)",
+                            ))?
+                            .try_into()?,
+                    ))))
+                }
                 (PrimitiveType::Time, JsonValue::String(s)) => {
                     Ok(Some(Literal::Primitive(PrimitiveLiteral::Long(
                         time::time_to_microseconds(&NaiveTime::parse_from_str(&s, "%H:%M:%S%.f")?),
@@ -1738,10 +1945,7 @@ impl Literal {
                 (_, JsonValue::Null) => Ok(None),
                 (i, j) => Err(Error::new(
                     crate::ErrorKind::DataInvalid,
-                    format!(
-                        "The json value {} doesn't fit to the iceberg type {}.",
-                        j, i
-                    ),
+                    format!("The json value {j} doesn't fit to the iceberg type {i}."),
                 )),
             },
             Type::Struct(schema) => {
@@ -1886,7 +2090,7 @@ impl Literal {
                 (_, PrimitiveLiteral::Binary(val)) => Ok(JsonValue::String(val.iter().fold(
                     String::new(),
                     |mut acc, x| {
-                        acc.push_str(&format!("{:x}", x));
+                        acc.push_str(&format!("{x:x}"));
                         acc
                     },
                 ))),
@@ -1944,10 +2148,7 @@ impl Literal {
             }
             (value, r#type) => Err(Error::new(
                 ErrorKind::DataInvalid,
-                format!(
-                    "The iceberg value {:?} doesn't fit to the iceberg type {}.",
-                    value, r#type
-                ),
+                format!("The iceberg value {value:?} doesn't fit to the iceberg type {type}."),
             )),
         }
     }
@@ -1965,6 +2166,7 @@ impl Literal {
                 PrimitiveLiteral::String(any) => Box::new(any),
                 PrimitiveLiteral::UInt128(any) => Box::new(any),
                 PrimitiveLiteral::Int128(any) => Box::new(any),
+                PrimitiveLiteral::AboveMax | PrimitiveLiteral::BelowMin => unimplemented!(),
             },
             _ => unimplemented!(),
         }
@@ -2064,7 +2266,7 @@ mod _serde {
     use serde_derive::{Deserialize as DeserializeDerive, Serialize as SerializeDerive};
 
     use super::{Literal, Map, PrimitiveLiteral};
-    use crate::spec::{PrimitiveType, Type, MAP_KEY_FIELD_NAME, MAP_VALUE_FIELD_NAME};
+    use crate::spec::{MAP_KEY_FIELD_NAME, MAP_VALUE_FIELD_NAME, PrimitiveType, Type};
     use crate::{Error, ErrorKind};
 
     #[derive(SerializeDerive, DeserializeDerive, Debug)]
@@ -2283,6 +2485,12 @@ mod _serde {
                     super::PrimitiveLiteral::Int128(v) => {
                         RawLiteralEnum::Bytes(ByteBuf::from(v.to_be_bytes()))
                     }
+                    super::PrimitiveLiteral::AboveMax | super::PrimitiveLiteral::BelowMin => {
+                        return Err(Error::new(
+                            ErrorKind::DataInvalid,
+                            "Can't convert AboveMax or BelowMax",
+                        ));
+                    }
                 },
                 Literal::Struct(r#struct) => {
                     let mut required = Vec::new();
@@ -2313,7 +2521,7 @@ mod _serde {
                     } else {
                         return Err(Error::new(
                             ErrorKind::DataInvalid,
-                            format!("Type {} should be a struct", ty),
+                            format!("Type {ty} should be a struct"),
                         ));
                     }
                     RawLiteralEnum::Record(Record { required, optional })
@@ -2336,7 +2544,7 @@ mod _serde {
                     } else {
                         return Err(Error::new(
                             ErrorKind::DataInvalid,
-                            format!("Type {} should be a list", ty),
+                            format!("Type {ty} should be a list"),
                         ));
                     }
                 }
@@ -2404,7 +2612,7 @@ mod _serde {
                     } else {
                         return Err(Error::new(
                             ErrorKind::DataInvalid,
-                            format!("Type {} should be a map", ty),
+                            format!("Type {ty} should be a map"),
                         ));
                     }
                 }
@@ -2417,8 +2625,7 @@ mod _serde {
                 Error::new(
                     ErrorKind::DataInvalid,
                     format!(
-                        "Unable to convert raw literal ({}) fail convert to type {} for: type mismatch",
-                        v, ty
+                        "Unable to convert raw literal ({v}) fail convert to type {ty} for: type mismatch"
                     ),
                 )
             };
@@ -2426,8 +2633,7 @@ mod _serde {
                 Error::new(
                     ErrorKind::DataInvalid,
                     format!(
-                        "Unable to convert raw literal ({}) fail convert to type {} for: {}",
-                        v, ty, reason
+                        "Unable to convert raw literal ({v}) fail convert to type {ty} for: {reason}"
                     ),
                 )
             };
@@ -2487,160 +2693,163 @@ mod _serde {
                     "bytes",
                     "todo: rust avro doesn't support deserialize any bytes representation now",
                 )),
-                RawLiteralEnum::List(v) => {
-                    match ty {
-                        Type::List(ty) => Ok(Some(Literal::List(
-                            v.list
-                                .into_iter()
-                                .map(|v| {
-                                    if let Some(v) = v {
-                                        v.try_into(&ty.element_field.field_type)
-                                    } else {
-                                        Ok(None)
+                RawLiteralEnum::List(v) => match ty {
+                    Type::List(ty) => Ok(Some(Literal::List(
+                        v.list
+                            .into_iter()
+                            .map(|v| {
+                                if let Some(v) = v {
+                                    v.try_into(&ty.element_field.field_type)
+                                } else {
+                                    Ok(None)
+                                }
+                            })
+                            .collect::<Result<_, Error>>()?,
+                    ))),
+                    Type::Map(map_ty) => {
+                        let key_ty = map_ty.key_field.field_type.as_ref();
+                        let value_ty = map_ty.value_field.field_type.as_ref();
+                        let mut map = Map::new();
+                        for k_v in v.list {
+                            let k_v = k_v.ok_or_else(|| invalid_err_with_reason("list","In deserialize, None will be represented as Some(RawLiteral::Null), all element in list must be valid"))?;
+                            if let RawLiteralEnum::Record(Record {
+                                required,
+                                optional: _,
+                            }) = k_v
+                            {
+                                if required.len() != 2 {
+                                    return Err(invalid_err_with_reason(
+                                        "list",
+                                        "Record must contains two element(key and value) of array",
+                                    ));
+                                }
+                                let mut key = None;
+                                let mut value = None;
+                                required.into_iter().for_each(|(k, v)| {
+                                    if k == MAP_KEY_FIELD_NAME {
+                                        key = Some(v);
+                                    } else if k == MAP_VALUE_FIELD_NAME {
+                                        value = Some(v);
                                     }
-                                })
-                                .collect::<Result<_, Error>>()?,
-                        ))),
-                        Type::Map(map_ty) => {
-                            let key_ty = map_ty.key_field.field_type.as_ref();
-                            let value_ty = map_ty.value_field.field_type.as_ref();
-                            let mut map = Map::new();
-                            for k_v in v.list {
-                                let k_v = k_v.ok_or_else(|| invalid_err_with_reason("list","In deserialize, None will be represented as Some(RawLiteral::Null), all element in list must be valid"))?;
-                                if let RawLiteralEnum::Record(Record {
-                                    required,
-                                    optional: _,
-                                }) = k_v
-                                {
-                                    if required.len() != 2 {
-                                        return Err(invalid_err_with_reason("list","Record must contains two element(key and value) of array"));
+                                });
+                                match (key, value) {
+                                    (Some(k), Some(v)) => {
+                                        let key = k.try_into(key_ty)?.ok_or_else(|| {
+                                            invalid_err_with_reason(
+                                                "list",
+                                                "Key element in Map must be valid",
+                                            )
+                                        })?;
+                                        let value = v.try_into(value_ty)?;
+                                        if map_ty.value_field.required && value.is_none() {
+                                            return Err(invalid_err_with_reason(
+                                                "list",
+                                                "Value element is required in this Map",
+                                            ));
+                                        }
+                                        map.insert(key, value);
                                     }
-                                    let mut key = None;
-                                    let mut value = None;
-                                    required.into_iter().for_each(|(k, v)| {
-                                        if k == MAP_KEY_FIELD_NAME {
-                                            key = Some(v);
-                                        } else if k == MAP_VALUE_FIELD_NAME {
-                                            value = Some(v);
-                                        }
-                                    });
-                                    match (key, value) {
-                                        (Some(k), Some(v)) => {
-                                            let key = k.try_into(key_ty)?.ok_or_else(|| {
-                                                invalid_err_with_reason(
-                                                    "list",
-                                                    "Key element in Map must be valid",
-                                                )
-                                            })?;
-                                            let value = v.try_into(value_ty)?;
-                                            if map_ty.value_field.required && value.is_none() {
-                                                return Err(invalid_err_with_reason(
-                                                    "list",
-                                                    "Value element is required in this Map",
-                                                ));
-                                            }
-                                            map.insert(key, value);
-                                        }
-                                        _ => return Err(invalid_err_with_reason(
+                                    _ => {
+                                        return Err(invalid_err_with_reason(
                                             "list",
                                             "The elements of record in list are not key and value",
-                                        )),
+                                        ));
                                     }
-                                } else {
-                                    return Err(invalid_err_with_reason(
-                                        "list",
-                                        "Map should represented as record array.",
-                                    ));
                                 }
-                            }
-                            Ok(Some(Literal::Map(map)))
-                        }
-                        Type::Primitive(PrimitiveType::Uuid) => {
-                            if v.list.len() != 16 {
+                            } else {
                                 return Err(invalid_err_with_reason(
                                     "list",
-                                    "The length of list should be 16",
+                                    "Map should represented as record array.",
                                 ));
                             }
-                            let mut bytes = [0u8; 16];
-                            for (i, v) in v.list.iter().enumerate() {
-                                if let Some(RawLiteralEnum::Long(v)) = v {
-                                    bytes[i] = *v as u8;
-                                } else {
-                                    return Err(invalid_err_with_reason(
-                                        "list",
-                                        "The element of list should be int",
-                                    ));
-                                }
-                            }
-                            Ok(Some(Literal::uuid(uuid::Uuid::from_bytes(bytes))))
                         }
-                        Type::Primitive(PrimitiveType::Decimal {
-                            precision: _,
-                            scale: _,
-                        }) => {
-                            if v.list.len() != 16 {
-                                return Err(invalid_err_with_reason(
-                                    "list",
-                                    "The length of list should be 16",
-                                ));
-                            }
-                            let mut bytes = [0u8; 16];
-                            for (i, v) in v.list.iter().enumerate() {
-                                if let Some(RawLiteralEnum::Long(v)) = v {
-                                    bytes[i] = *v as u8;
-                                } else {
-                                    return Err(invalid_err_with_reason(
-                                        "list",
-                                        "The element of list should be int",
-                                    ));
-                                }
-                            }
-                            Ok(Some(Literal::decimal(i128::from_be_bytes(bytes))))
-                        }
-                        Type::Primitive(PrimitiveType::Binary) => {
-                            let bytes = v
-                                .list
-                                .into_iter()
-                                .map(|v| {
-                                    if let Some(RawLiteralEnum::Long(v)) = v {
-                                        Ok(v as u8)
-                                    } else {
-                                        Err(invalid_err_with_reason(
-                                            "list",
-                                            "The element of list should be int",
-                                        ))
-                                    }
-                                })
-                                .collect::<Result<Vec<_>, Error>>()?;
-                            Ok(Some(Literal::binary(bytes)))
-                        }
-                        Type::Primitive(PrimitiveType::Fixed(size)) => {
-                            if v.list.len() != *size as usize {
-                                return Err(invalid_err_with_reason(
-                                    "list",
-                                    "The length of list should be equal to size",
-                                ));
-                            }
-                            let bytes = v
-                                .list
-                                .into_iter()
-                                .map(|v| {
-                                    if let Some(RawLiteralEnum::Long(v)) = v {
-                                        Ok(v as u8)
-                                    } else {
-                                        Err(invalid_err_with_reason(
-                                            "list",
-                                            "The element of list should be int",
-                                        ))
-                                    }
-                                })
-                                .collect::<Result<Vec<_>, Error>>()?;
-                            Ok(Some(Literal::fixed(bytes)))
-                        }
-                        _ => Err(invalid_err("list")),
+                        Ok(Some(Literal::Map(map)))
                     }
-                }
+                    Type::Primitive(PrimitiveType::Uuid) => {
+                        if v.list.len() != 16 {
+                            return Err(invalid_err_with_reason(
+                                "list",
+                                "The length of list should be 16",
+                            ));
+                        }
+                        let mut bytes = [0u8; 16];
+                        for (i, v) in v.list.iter().enumerate() {
+                            if let Some(RawLiteralEnum::Long(v)) = v {
+                                bytes[i] = *v as u8;
+                            } else {
+                                return Err(invalid_err_with_reason(
+                                    "list",
+                                    "The element of list should be int",
+                                ));
+                            }
+                        }
+                        Ok(Some(Literal::uuid(uuid::Uuid::from_bytes(bytes))))
+                    }
+                    Type::Primitive(PrimitiveType::Decimal {
+                        precision: _,
+                        scale: _,
+                    }) => {
+                        if v.list.len() != 16 {
+                            return Err(invalid_err_with_reason(
+                                "list",
+                                "The length of list should be 16",
+                            ));
+                        }
+                        let mut bytes = [0u8; 16];
+                        for (i, v) in v.list.iter().enumerate() {
+                            if let Some(RawLiteralEnum::Long(v)) = v {
+                                bytes[i] = *v as u8;
+                            } else {
+                                return Err(invalid_err_with_reason(
+                                    "list",
+                                    "The element of list should be int",
+                                ));
+                            }
+                        }
+                        Ok(Some(Literal::decimal(i128::from_be_bytes(bytes))))
+                    }
+                    Type::Primitive(PrimitiveType::Binary) => {
+                        let bytes = v
+                            .list
+                            .into_iter()
+                            .map(|v| {
+                                if let Some(RawLiteralEnum::Long(v)) = v {
+                                    Ok(v as u8)
+                                } else {
+                                    Err(invalid_err_with_reason(
+                                        "list",
+                                        "The element of list should be int",
+                                    ))
+                                }
+                            })
+                            .collect::<Result<Vec<_>, Error>>()?;
+                        Ok(Some(Literal::binary(bytes)))
+                    }
+                    Type::Primitive(PrimitiveType::Fixed(size)) => {
+                        if v.list.len() != *size as usize {
+                            return Err(invalid_err_with_reason(
+                                "list",
+                                "The length of list should be equal to size",
+                            ));
+                        }
+                        let bytes = v
+                            .list
+                            .into_iter()
+                            .map(|v| {
+                                if let Some(RawLiteralEnum::Long(v)) = v {
+                                    Ok(v as u8)
+                                } else {
+                                    Err(invalid_err_with_reason(
+                                        "list",
+                                        "The element of list should be int",
+                                    ))
+                                }
+                            })
+                            .collect::<Result<Vec<_>, Error>>()?;
+                        Ok(Some(Literal::fixed(bytes)))
+                    }
+                    _ => Err(invalid_err("list")),
+                },
                 RawLiteralEnum::Record(Record {
                     required,
                     optional: _,
@@ -2698,9 +2907,9 @@ mod tests {
 
     use super::*;
     use crate::avro::schema_to_avro_schema;
-    use crate::spec::datatypes::{ListType, MapType, NestedField, StructType};
     use crate::spec::Schema;
     use crate::spec::Type::Primitive;
+    use crate::spec::datatypes::{ListType, MapType, NestedField, StructType};
 
     fn check_json_serde(json: &str, expected_literal: Literal, expected_type: &Type) {
         let raw_json_value = serde_json::from_str::<JsonValue>(json).unwrap();
@@ -2728,7 +2937,7 @@ mod tests {
         assert_eq!(datum, expected_datum);
 
         let mut writer = apache_avro::Writer::new(&schema, Vec::new());
-        writer.append_ser(datum.to_bytes()).unwrap();
+        writer.append_ser(datum.to_bytes().unwrap()).unwrap();
         let encoded = writer.into_inner().unwrap();
         let reader = apache_avro::Reader::with_schema(&schema, &*encoded).unwrap();
 
@@ -3024,6 +3233,13 @@ mod tests {
     }
 
     #[test]
+    fn avro_bytes_long_from_int() {
+        let bytes = vec![32u8, 0u8, 0u8, 0u8];
+
+        check_avro_bytes_serde(bytes, Datum::long(32), &PrimitiveType::Long);
+    }
+
+    #[test]
     fn avro_bytes_float() {
         let bytes = vec![0u8, 0u8, 128u8, 63u8];
 
@@ -3038,10 +3254,64 @@ mod tests {
     }
 
     #[test]
+    fn avro_bytes_double_from_float() {
+        let bytes = vec![0u8, 0u8, 128u8, 63u8];
+
+        check_avro_bytes_serde(bytes, Datum::double(1.0), &PrimitiveType::Double);
+    }
+
+    #[test]
     fn avro_bytes_string() {
         let bytes = vec![105u8, 99u8, 101u8, 98u8, 101u8, 114u8, 103u8];
 
         check_avro_bytes_serde(bytes, Datum::string("iceberg"), &PrimitiveType::String);
+    }
+
+    #[test]
+    fn avro_bytes_decimal() {
+        // (input_bytes, decimal_num, expect_scale, expect_precision)
+        let cases = vec![
+            (vec![4u8, 210u8], 1234, 2, 38),
+            (vec![251u8, 46u8], -1234, 2, 38),
+            (vec![4u8, 210u8], 1234, 3, 38),
+            (vec![251u8, 46u8], -1234, 3, 38),
+            (vec![42u8], 42, 2, 1),
+            (vec![214u8], -42, 2, 1),
+        ];
+
+        for (input_bytes, decimal_num, expect_scale, expect_precision) in cases {
+            check_avro_bytes_serde(
+                input_bytes,
+                Datum::decimal_with_precision(
+                    Decimal::new(decimal_num, expect_scale),
+                    expect_precision,
+                )
+                .unwrap(),
+                &PrimitiveType::Decimal {
+                    precision: expect_precision,
+                    scale: expect_scale,
+                },
+            );
+        }
+    }
+
+    #[test]
+    fn avro_bytes_decimal_expect_error() {
+        // (decimal_num, expect_scale, expect_precision)
+        let cases = vec![(1234, 2, 1)];
+
+        for (decimal_num, expect_scale, expect_precision) in cases {
+            let result = Datum::decimal_with_precision(
+                Decimal::new(decimal_num, expect_scale),
+                expect_precision,
+            );
+            assert!(result.is_err(), "expect error but got {result:?}");
+            assert_eq!(
+                result.unwrap_err().kind(),
+                ErrorKind::DataInvalid,
+                "expect error DataInvalid",
+            );
+        }
     }
 
     #[test]
@@ -3175,7 +3445,7 @@ mod tests {
             match (&desered_literal, &struct_literal) {
                 (Literal::Struct(desered), Literal::Struct(expected)) => {
                     match (&desered.fields[0], &expected.fields[0]) {
-                        (Literal::Map(desered), Literal::Map(expected)) => {
+                        (Some(Literal::Map(desered)), Some(Literal::Map(expected))) => {
                             assert!(desered.has_same_content(expected))
                         }
                         _ => {
@@ -3352,6 +3622,9 @@ mod tests {
         let value = Datum::timestamp_from_str("2021-08-01T01:09:00.0899").unwrap();
         assert_eq!(&format!("{value}"), "2021-08-01 01:09:00.089900");
 
+        let value = Datum::timestamp_from_str("2023-01-06T00:00:00").unwrap();
+        assert_eq!(&format!("{value}"), "2023-01-06 00:00:00");
+
         let value = Datum::timestamp_from_str("2021-08-01T01:09:00.0899+0800");
         assert!(value.is_err(), "Parse timestamp with timezone should fail!");
 
@@ -3474,5 +3747,255 @@ mod tests {
         let expected = Datum::date(12345);
 
         assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_datum_long_convert_to_int() {
+        let datum = Datum::long(12345);
+
+        let result = datum.to(&Primitive(PrimitiveType::Int)).unwrap();
+
+        let expected = Datum::int(12345);
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_datum_long_convert_to_int_above_max() {
+        let datum = Datum::long(INT_MAX as i64 + 1);
+
+        let result = datum.to(&Primitive(PrimitiveType::Int)).unwrap();
+
+        let expected = Datum::new(PrimitiveType::Int, PrimitiveLiteral::AboveMax);
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_datum_long_convert_to_int_below_min() {
+        let datum = Datum::long(INT_MIN as i64 - 1);
+
+        let result = datum.to(&Primitive(PrimitiveType::Int)).unwrap();
+
+        let expected = Datum::new(PrimitiveType::Int, PrimitiveLiteral::BelowMin);
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_datum_long_convert_to_timestamp() {
+        let datum = Datum::long(12345);
+
+        let result = datum.to(&Primitive(PrimitiveType::Timestamp)).unwrap();
+
+        let expected = Datum::timestamp_micros(12345);
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_datum_long_convert_to_timestamptz() {
+        let datum = Datum::long(12345);
+
+        let result = datum.to(&Primitive(PrimitiveType::Timestamptz)).unwrap();
+
+        let expected = Datum::timestamptz_micros(12345);
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_datum_decimal_convert_to_long() {
+        let datum = Datum::decimal(12345).unwrap();
+
+        let result = datum.to(&Primitive(PrimitiveType::Long)).unwrap();
+
+        let expected = Datum::long(12345);
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_datum_decimal_convert_to_long_above_max() {
+        let datum = Datum::decimal(LONG_MAX as i128 + 1).unwrap();
+
+        let result = datum.to(&Primitive(PrimitiveType::Long)).unwrap();
+
+        let expected = Datum::new(PrimitiveType::Long, PrimitiveLiteral::AboveMax);
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_datum_decimal_convert_to_long_below_min() {
+        let datum = Datum::decimal(LONG_MIN as i128 - 1).unwrap();
+
+        let result = datum.to(&Primitive(PrimitiveType::Long)).unwrap();
+
+        let expected = Datum::new(PrimitiveType::Long, PrimitiveLiteral::BelowMin);
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_datum_string_convert_to_boolean() {
+        let datum = Datum::string("true");
+
+        let result = datum.to(&Primitive(PrimitiveType::Boolean)).unwrap();
+
+        let expected = Datum::bool(true);
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_datum_string_convert_to_int() {
+        let datum = Datum::string("12345");
+
+        let result = datum.to(&Primitive(PrimitiveType::Int)).unwrap();
+
+        let expected = Datum::int(12345);
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_datum_string_convert_to_long() {
+        let datum = Datum::string("12345");
+
+        let result = datum.to(&Primitive(PrimitiveType::Long)).unwrap();
+
+        let expected = Datum::long(12345);
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_datum_string_convert_to_timestamp() {
+        let datum = Datum::string("1925-05-20T19:25:00.000");
+
+        let result = datum.to(&Primitive(PrimitiveType::Timestamp)).unwrap();
+
+        let expected = Datum::timestamp_micros(-1407990900000000);
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_datum_string_convert_to_timestamptz() {
+        let datum = Datum::string("1925-05-20T19:25:00.000 UTC");
+
+        let result = datum.to(&Primitive(PrimitiveType::Timestamptz)).unwrap();
+
+        let expected = Datum::timestamptz_micros(-1407990900000000);
+
+        assert_eq!(result, expected);
+    }
+
+    #[test]
+    fn test_iceberg_float_order() {
+        // Test float ordering
+        let float_values = vec![
+            Datum::float(f32::NAN),
+            Datum::float(-f32::NAN),
+            Datum::float(f32::MAX),
+            Datum::float(f32::MIN),
+            Datum::float(f32::INFINITY),
+            Datum::float(-f32::INFINITY),
+            Datum::float(1.0),
+            Datum::float(-1.0),
+            Datum::float(0.0),
+            Datum::float(-0.0),
+        ];
+
+        let mut float_sorted = float_values.clone();
+        float_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let float_expected = vec![
+            Datum::float(-f32::NAN),
+            Datum::float(-f32::INFINITY),
+            Datum::float(f32::MIN),
+            Datum::float(-1.0),
+            Datum::float(-0.0),
+            Datum::float(0.0),
+            Datum::float(1.0),
+            Datum::float(f32::MAX),
+            Datum::float(f32::INFINITY),
+            Datum::float(f32::NAN),
+        ];
+
+        assert_eq!(float_sorted, float_expected);
+
+        // Test double ordering
+        let double_values = vec![
+            Datum::double(f64::NAN),
+            Datum::double(-f64::NAN),
+            Datum::double(f64::INFINITY),
+            Datum::double(-f64::INFINITY),
+            Datum::double(f64::MAX),
+            Datum::double(f64::MIN),
+            Datum::double(1.0),
+            Datum::double(-1.0),
+            Datum::double(0.0),
+            Datum::double(-0.0),
+        ];
+
+        let mut double_sorted = double_values.clone();
+        double_sorted.sort_by(|a, b| a.partial_cmp(b).unwrap());
+
+        let double_expected = vec![
+            Datum::double(-f64::NAN),
+            Datum::double(-f64::INFINITY),
+            Datum::double(f64::MIN),
+            Datum::double(-1.0),
+            Datum::double(-0.0),
+            Datum::double(0.0),
+            Datum::double(1.0),
+            Datum::double(f64::MAX),
+            Datum::double(f64::INFINITY),
+            Datum::double(f64::NAN),
+        ];
+
+        assert_eq!(double_sorted, double_expected);
+    }
+
+    /// Test Date deserialization from JSON as number (days since epoch).
+    ///
+    /// This reproduces the scenario from Iceberg Java's TestAddFilesProcedure where:
+    /// - Date partition columns have initial_default values in manifests
+    /// - These values are serialized as days since epoch (e.g., 18628 for 2021-01-01)
+    /// - The JSON schema includes: {"type":"date","initial-default":18628}
+    ///
+    /// Prior to this fix, Date values in JSON were only parsed from String format ("2021-01-01"),
+    /// causing initial_default values to be lost during schema deserialization.
+    ///
+    /// This test ensures both formats are supported:
+    /// - String format: "2021-01-01" (used in table metadata)
+    /// - Number format: 18628 (used in initial-default values from add_files)
+    ///
+    /// See: Iceberg Java TestAddFilesProcedure.addDataPartitionedByDateToPartitioned()
+    #[test]
+    fn test_date_from_json_as_number() {
+        use serde_json::json;
+
+        // Test Date as number (days since epoch) - used in initial-default from add_files
+        let date_number = json!(18628); // 2021-01-01 is 18628 days since 1970-01-01
+        let result =
+            Literal::try_from_json(date_number, &Type::Primitive(PrimitiveType::Date)).unwrap();
+        assert_eq!(
+            result,
+            Some(Literal::Primitive(PrimitiveLiteral::Int(18628)))
+        );
+
+        // Test Date as string - traditional format
+        let date_string = json!("2021-01-01");
+        let result =
+            Literal::try_from_json(date_string, &Type::Primitive(PrimitiveType::Date)).unwrap();
+        assert_eq!(
+            result,
+            Some(Literal::Primitive(PrimitiveLiteral::Int(18628)))
+        );
+
+        // Both formats should produce the same Literal value
     }
 }

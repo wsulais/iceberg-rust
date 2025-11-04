@@ -25,9 +25,9 @@ pub(crate) fn from_aws_sdk_error<T>(error: aws_sdk_glue::error::SdkError<T>) -> 
 where T: Debug {
     Error::new(
         ErrorKind::Unexpected,
-        "Operation failed for hitting aws skd error".to_string(),
+        "Operation failed for hitting aws sdk error".to_string(),
     )
-    .with_source(anyhow!("aws sdk error: {:?}", error))
+    .with_source(anyhow!("aws sdk error: {error:?}"))
 }
 
 /// Format AWS Build error into iceberg error
@@ -36,5 +36,5 @@ pub(crate) fn from_aws_build_error(error: aws_sdk_glue::error::BuildError) -> Er
         ErrorKind::Unexpected,
         "Operation failed for hitting aws build error".to_string(),
     )
-    .with_source(anyhow!("aws build error: {:?}", error))
+    .with_source(anyhow!("aws build error: {error:?}"))
 }

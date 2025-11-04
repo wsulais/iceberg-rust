@@ -16,7 +16,7 @@
 // under the License.
 
 use hive_metastore::FieldSchema;
-use iceberg::spec::{visit_schema, PrimitiveType, Schema, SchemaVisitor};
+use iceberg::spec::{PrimitiveType, Schema, SchemaVisitor, visit_schema};
 use iceberg::{Error, ErrorKind, Result};
 
 type HiveSchema = Vec<FieldSchema>;
@@ -100,7 +100,7 @@ impl SchemaVisitor for HiveSchemaBuilder {
     }
 
     fn list(&mut self, _list: &iceberg::spec::ListType, value: String) -> iceberg::Result<String> {
-        Ok(format!("array<{}>", value))
+        Ok(format!("array<{value}>"))
     }
 
     fn map(
@@ -109,7 +109,7 @@ impl SchemaVisitor for HiveSchemaBuilder {
         key_value: String,
         value: String,
     ) -> iceberg::Result<String> {
-        Ok(format!("map<{},{}>", key_value, value))
+        Ok(format!("map<{key_value},{value}>"))
     }
 
     fn primitive(&mut self, p: &iceberg::spec::PrimitiveType) -> iceberg::Result<String> {
@@ -128,13 +128,13 @@ impl SchemaVisitor for HiveSchemaBuilder {
             }
             PrimitiveType::Binary | PrimitiveType::Fixed(_) => "binary".to_string(),
             PrimitiveType::Decimal { precision, scale } => {
-                format!("decimal({},{})", precision, scale)
+                format!("decimal({precision},{scale})")
             }
             _ => {
                 return Err(Error::new(
                     ErrorKind::FeatureUnsupported,
                     "Conversion from 'Timestamptz' is not supported",
-                ))
+                ));
             }
         };
 
@@ -144,8 +144,8 @@ impl SchemaVisitor for HiveSchemaBuilder {
 
 #[cfg(test)]
 mod tests {
-    use iceberg::spec::Schema;
     use iceberg::Result;
+    use iceberg::spec::Schema;
 
     use super::*;
 

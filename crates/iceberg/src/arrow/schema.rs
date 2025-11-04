@@ -20,15 +20,14 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use arrow_array::types::{
-    validate_decimal_precision_and_scale, Decimal128Type, TimestampMicrosecondType,
-};
+use arrow_array::types::{Decimal128Type, validate_decimal_precision_and_scale};
 use arrow_array::{
-    BooleanArray, Date32Array, Datum as ArrowDatum, Float32Array, Float64Array, Int32Array,
-    Int64Array, PrimitiveArray, Scalar, StringArray, TimestampMicrosecondArray,
+    BooleanArray, Date32Array, Datum as ArrowDatum, Decimal128Array, FixedSizeBinaryArray,
+    Float32Array, Float64Array, Int32Array, Int64Array, Scalar, StringArray,
+    TimestampMicrosecondArray,
 };
 use arrow_schema::{DataType, Field, Fields, Schema as ArrowSchema, TimeUnit};
-use bitvec::macros::internal::funty::Fundamental;
+use num_bigint::BigInt;
 use parquet::arrow::PARQUET_FIELD_ID_META_KEY;
 use parquet::file::statistics::Statistics;
 use rust_decimal::prelude::ToPrimitive;
@@ -42,7 +41,9 @@ use crate::spec::{
 use crate::{Error, ErrorKind};
 
 /// When iceberg map type convert to Arrow map type, the default map field name is "key_value".
-pub(crate) const DEFAULT_MAP_FIELD_NAME: &str = "key_value";
+pub const DEFAULT_MAP_FIELD_NAME: &str = "key_value";
+/// UTC time zone for Arrow timestamp type.
+pub const UTC_TIME_ZONE: &str = "+00:00";
 
 /// A post order arrow schema visitor.
 ///
@@ -119,8 +120,10 @@ fn visit_type<V: ArrowSchemaVisitor>(r#type: &DataType, visitor: &mut V) -> Resu
                 DataType::Boolean
                     | DataType::Utf8
                     | DataType::LargeUtf8
+                    | DataType::Utf8View
                     | DataType::Binary
                     | DataType::LargeBinary
+                    | DataType::BinaryView
                     | DataType::FixedSizeBinary(_)
             ) =>
         {
@@ -163,6 +166,7 @@ fn visit_type<V: ArrowSchemaVisitor>(r#type: &DataType, visitor: &mut V) -> Resu
             )),
         },
         DataType::Struct(fields) => visit_struct(fields, visitor),
+        DataType::Dictionary(_key_type, value_type) => visit_type(value_type, visitor),
         other => Err(Error::new(
             ErrorKind::DataInvalid,
             format!("Cannot visit Arrow data type: {other}"),
@@ -208,6 +212,10 @@ fn visit_schema<V: ArrowSchemaVisitor>(schema: &ArrowSchema, visitor: &mut V) ->
 }
 
 /// Convert Arrow schema to Iceberg schema.
+///
+/// Iceberg schema fields require a unique field id, and this function assumes that each field
+/// in the provided Arrow schema contains a field id in its metadata. If the metadata is missing
+/// or the field id is not set, the conversion will fail
 pub fn arrow_schema_to_schema(schema: &ArrowSchema) -> Result<Schema> {
     let mut visitor = ArrowSchemaConverter::new();
     visit_schema(schema, &mut visitor)
@@ -221,7 +229,7 @@ pub fn arrow_type_to_type(ty: &DataType) -> Result<Type> {
 
 const ARROW_FIELD_DOC_KEY: &str = "doc";
 
-fn get_field_id(field: &Field) -> Result<i32> {
+pub(super) fn get_field_id(field: &Field) -> Result<i32> {
     if let Some(value) = field.metadata().get(PARQUET_FIELD_ID_META_KEY) {
         return value.parse::<i32>().map_err(|e| {
             Error::new(
@@ -298,7 +306,7 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     "List type must have list data type",
-                ))
+                ));
             }
         };
 
@@ -367,8 +375,19 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
     fn primitive(&mut self, p: &DataType) -> Result<Self::T> {
         match p {
             DataType::Boolean => Ok(Type::Primitive(PrimitiveType::Boolean)),
-            DataType::Int32 => Ok(Type::Primitive(PrimitiveType::Int)),
+            DataType::Int8 | DataType::Int16 | DataType::Int32 => {
+                Ok(Type::Primitive(PrimitiveType::Int))
+            }
+            DataType::UInt8 | DataType::UInt16 => Ok(Type::Primitive(PrimitiveType::Int)),
+            DataType::UInt32 => Ok(Type::Primitive(PrimitiveType::Long)),
             DataType::Int64 => Ok(Type::Primitive(PrimitiveType::Long)),
+            DataType::UInt64 => {
+                // Block uint64 - no safe casting option
+                Err(Error::new(
+                    ErrorKind::DataInvalid,
+                    "UInt64 is not supported. Use Int64 for values ≤ 9,223,372,036,854,775,807 or Decimal(20,0) for full uint64 range.",
+                ))
+            }
             DataType::Float32 => Ok(Type::Primitive(PrimitiveType::Float)),
             DataType::Float64 => Ok(Type::Primitive(PrimitiveType::Double)),
             DataType::Decimal128(p, s) => Type::decimal(*p as u32, *s as u32).map_err(|e| {
@@ -385,17 +404,30 @@ impl ArrowSchemaVisitor for ArrowSchemaConverter {
             DataType::Timestamp(unit, None) if unit == &TimeUnit::Microsecond => {
                 Ok(Type::Primitive(PrimitiveType::Timestamp))
             }
+            DataType::Timestamp(unit, None) if unit == &TimeUnit::Nanosecond => {
+                Ok(Type::Primitive(PrimitiveType::TimestampNs))
+            }
             DataType::Timestamp(unit, Some(zone))
                 if unit == &TimeUnit::Microsecond
                     && (zone.as_ref() == "UTC" || zone.as_ref() == "+00:00") =>
             {
                 Ok(Type::Primitive(PrimitiveType::Timestamptz))
             }
-            DataType::Binary | DataType::LargeBinary => Ok(Type::Primitive(PrimitiveType::Binary)),
+            DataType::Timestamp(unit, Some(zone))
+                if unit == &TimeUnit::Nanosecond
+                    && (zone.as_ref() == "UTC" || zone.as_ref() == "+00:00") =>
+            {
+                Ok(Type::Primitive(PrimitiveType::TimestamptzNs))
+            }
+            DataType::Binary | DataType::LargeBinary | DataType::BinaryView => {
+                Ok(Type::Primitive(PrimitiveType::Binary))
+            }
             DataType::FixedSizeBinary(width) => {
                 Ok(Type::Primitive(PrimitiveType::Fixed(*width as u64)))
             }
-            DataType::Utf8 | DataType::LargeUtf8 => Ok(Type::Primitive(PrimitiveType::String)),
+            DataType::Utf8View | DataType::Utf8 | DataType::LargeUtf8 => {
+                Ok(Type::Primitive(PrimitiveType::String))
+            }
             _ => Err(Error::new(
                 ErrorKind::DataInvalid,
                 format!("Unsupported Arrow data type: {p}"),
@@ -580,14 +612,14 @@ impl SchemaVisitor for ToArrowSchemaConverter {
             )),
             crate::spec::PrimitiveType::Timestamptz => Ok(ArrowSchemaOrFieldOrType::Type(
                 // Timestampz always stored as UTC
-                DataType::Timestamp(TimeUnit::Microsecond, Some("+00:00".into())),
+                DataType::Timestamp(TimeUnit::Microsecond, Some(UTC_TIME_ZONE.into())),
             )),
             crate::spec::PrimitiveType::TimestampNs => Ok(ArrowSchemaOrFieldOrType::Type(
                 DataType::Timestamp(TimeUnit::Nanosecond, None),
             )),
             crate::spec::PrimitiveType::TimestamptzNs => Ok(ArrowSchemaOrFieldOrType::Type(
                 // Store timestamptz_ns as UTC
-                DataType::Timestamp(TimeUnit::Nanosecond, Some("+00:00".into())),
+                DataType::Timestamp(TimeUnit::Nanosecond, Some(UTC_TIME_ZONE.into())),
             )),
             crate::spec::PrimitiveType::String => {
                 Ok(ArrowSchemaOrFieldOrType::Type(DataType::Utf8))
@@ -626,169 +658,347 @@ pub fn type_to_arrow_type(ty: &crate::spec::Type) -> crate::Result<DataType> {
 }
 
 /// Convert Iceberg Datum to Arrow Datum.
-pub(crate) fn get_arrow_datum(datum: &Datum) -> Result<Box<dyn ArrowDatum + Send>> {
+pub(crate) fn get_arrow_datum(datum: &Datum) -> Result<Arc<dyn ArrowDatum + Send + Sync>> {
     match (datum.data_type(), datum.literal()) {
         (PrimitiveType::Boolean, PrimitiveLiteral::Boolean(value)) => {
-            Ok(Box::new(BooleanArray::new_scalar(*value)))
+            Ok(Arc::new(BooleanArray::new_scalar(*value)))
         }
         (PrimitiveType::Int, PrimitiveLiteral::Int(value)) => {
-            Ok(Box::new(Int32Array::new_scalar(*value)))
+            Ok(Arc::new(Int32Array::new_scalar(*value)))
         }
         (PrimitiveType::Long, PrimitiveLiteral::Long(value)) => {
-            Ok(Box::new(Int64Array::new_scalar(*value)))
+            Ok(Arc::new(Int64Array::new_scalar(*value)))
         }
         (PrimitiveType::Float, PrimitiveLiteral::Float(value)) => {
-            Ok(Box::new(Float32Array::new_scalar(value.as_f32())))
+            Ok(Arc::new(Float32Array::new_scalar(value.to_f32().unwrap())))
         }
         (PrimitiveType::Double, PrimitiveLiteral::Double(value)) => {
-            Ok(Box::new(Float64Array::new_scalar(value.as_f64())))
+            Ok(Arc::new(Float64Array::new_scalar(value.to_f64().unwrap())))
         }
         (PrimitiveType::String, PrimitiveLiteral::String(value)) => {
-            Ok(Box::new(StringArray::new_scalar(value.as_str())))
+            Ok(Arc::new(StringArray::new_scalar(value.as_str())))
         }
         (PrimitiveType::Date, PrimitiveLiteral::Int(value)) => {
-            Ok(Box::new(Date32Array::new_scalar(*value)))
+            Ok(Arc::new(Date32Array::new_scalar(*value)))
         }
         (PrimitiveType::Timestamp, PrimitiveLiteral::Long(value)) => {
-            Ok(Box::new(TimestampMicrosecondArray::new_scalar(*value)))
+            Ok(Arc::new(TimestampMicrosecondArray::new_scalar(*value)))
         }
-        (PrimitiveType::Timestamptz, PrimitiveLiteral::Long(value)) => Ok(Box::new(Scalar::new(
-            PrimitiveArray::<TimestampMicrosecondType>::new(vec![*value; 1].into(), None)
-                .with_timezone("UTC"),
+        (PrimitiveType::Timestamptz, PrimitiveLiteral::Long(value)) => Ok(Arc::new(Scalar::new(
+            TimestampMicrosecondArray::new(vec![*value; 1].into(), None).with_timezone_utc(),
         ))),
+        (PrimitiveType::Decimal { precision, scale }, PrimitiveLiteral::Int128(value)) => {
+            let array = Decimal128Array::from_value(*value, 1)
+                .with_precision_and_scale(*precision as _, *scale as _)
+                .unwrap();
+            Ok(Arc::new(Scalar::new(array)))
+        }
+        (PrimitiveType::Uuid, PrimitiveLiteral::UInt128(value)) => {
+            let bytes = Uuid::from_u128(*value).into_bytes();
+            let array = FixedSizeBinaryArray::try_from_iter(vec![bytes].into_iter()).unwrap();
+            Ok(Arc::new(Scalar::new(array)))
+        }
 
-        (typ, _) => Err(Error::new(
+        (primitive_type, _) => Err(Error::new(
             ErrorKind::FeatureUnsupported,
-            format!(
-                "Converting datum from type {:?} to arrow not supported yet.",
-                typ
-            ),
+            format!("Converting datum from type {primitive_type:?} to arrow not supported yet."),
         )),
     }
 }
 
-macro_rules! get_parquet_stat_as_datum {
-    ($limit_type:tt) => {
-        paste::paste! {
-        /// Gets the $limit_type value from a parquet Statistics struct, as a Datum
-        pub(crate) fn [<get_parquet_stat_ $limit_type _as_datum>](
-            primitive_type: &PrimitiveType, stats: &Statistics
-        ) -> Result<Option<Datum>> {
-            Ok(match (primitive_type, stats) {
-                (PrimitiveType::Boolean, Statistics::Boolean(stats)) => stats.[<$limit_type _opt>]().map(|val|Datum::bool(*val)),
-                (PrimitiveType::Int, Statistics::Int32(stats)) => stats.[<$limit_type _opt>]().map(|val|Datum::int(*val)),
-                (PrimitiveType::Date, Statistics::Int32(stats)) => stats.[<$limit_type _opt>]().map(|val|Datum::date(*val)),
-                (PrimitiveType::Long, Statistics::Int64(stats)) => stats.[<$limit_type _opt>]().map(|val|Datum::long(*val)),
-                (PrimitiveType::Time, Statistics::Int64(stats)) => {
-                    let Some(val) = stats.[<$limit_type _opt>]() else {
-                        return Ok(None);
-                    };
-
-                    Some(Datum::time_micros(*val)?)
-                }
-                (PrimitiveType::Timestamp, Statistics::Int64(stats)) => {
-                    stats.[<$limit_type _opt>]().map(|val|Datum::timestamp_micros(*val))
-                }
-                (PrimitiveType::Timestamptz, Statistics::Int64(stats)) => {
-                    stats.[<$limit_type _opt>]().map(|val|Datum::timestamptz_micros(*val))
-                }
-                (PrimitiveType::TimestampNs, Statistics::Int64(stats)) => {
-                    stats.[<$limit_type _opt>]().map(|val|Datum::timestamp_nanos(*val))
-                }
-                (PrimitiveType::TimestamptzNs, Statistics::Int64(stats)) => {
-                    stats.[<$limit_type _opt>]().map(|val|Datum::timestamptz_nanos(*val))
-                }
-                (PrimitiveType::Float, Statistics::Float(stats)) => stats.[<$limit_type _opt>]().map(|val|Datum::float(*val)),
-                (PrimitiveType::Double, Statistics::Double(stats)) => stats.[<$limit_type _opt>]().map(|val|Datum::double(*val)),
-                (PrimitiveType::String, Statistics::ByteArray(stats)) => {
-                    let Some(val) = stats.[<$limit_type _opt>]() else {
-                        return Ok(None);
-                    };
-
-                    Some(Datum::string(val.as_utf8()?))
-                }
-                (PrimitiveType::Decimal {
-                    precision: _,
-                    scale: _,
-                }, Statistics::ByteArray(stats)) => {
-                    let Some(bytes) = stats.[<$limit_type _bytes_opt>]() else {
-                        return Ok(None);
-                    };
-
-                    Some(Datum::new(
-                        primitive_type.clone(),
-                        PrimitiveLiteral::Int128(i128::from_le_bytes(bytes.try_into()?)),
-                    ))
-                }
-                (
-                PrimitiveType::Decimal {
-                    precision: _,
-                    scale: _,
-                },
-                Statistics::Int32(stats)) => {
-                    stats.[<$limit_type _opt>]().map(|val| {
-                        Datum::new(
-                            primitive_type.clone(),
-                            PrimitiveLiteral::Int128(i128::from(*val)),
-                        )
-                    })
-                }
-
-                (
-                    PrimitiveType::Decimal {
-                        precision: _,
-                        scale: _,
-                    },
-                    Statistics::Int64(stats),
-                ) => {
-                    stats.[<$limit_type _opt>]().map(|val| {
-                        Datum::new(
-                            primitive_type.clone(),
-                            PrimitiveLiteral::Int128(i128::from(*val)),
-                        )
-                    })
-                }
-                (PrimitiveType::Uuid, Statistics::FixedLenByteArray(stats)) => {
-                    let Some(bytes) = stats.[<$limit_type _bytes_opt>]() else {
-                        return Ok(None);
-                    };
-                    if bytes.len() != 16 {
-                        return Err(Error::new(
-                            ErrorKind::Unexpected,
-                            "Invalid length of uuid bytes.",
-                        ));
-                    }
-                    Some(Datum::uuid(Uuid::from_bytes(
-                        bytes[..16].try_into().unwrap(),
-                    )))
-                }
-                (PrimitiveType::Fixed(len), Statistics::FixedLenByteArray(stat)) => {
-                    let Some(bytes) = stat.[<$limit_type _bytes_opt>]() else {
-                        return Ok(None);
-                    };
-                    if bytes.len() != *len as usize {
-                        return Err(Error::new(
-                            ErrorKind::Unexpected,
-                            "Invalid length of fixed bytes.",
-                        ));
-                    }
-                    Some(Datum::fixed(bytes.to_vec()))
-                }
-                (PrimitiveType::Binary, Statistics::ByteArray(stat)) => {
-                    return Ok(stat.[<$limit_type _bytes_opt>]().map(|bytes|Datum::binary(bytes.to_vec())))
-                }
-                _ => {
-                    return Ok(None);
-                }
-            })
-            }
+pub(crate) fn get_parquet_stat_min_as_datum(
+    primitive_type: &PrimitiveType,
+    stats: &Statistics,
+) -> Result<Option<Datum>> {
+    Ok(match (primitive_type, stats) {
+        (PrimitiveType::Boolean, Statistics::Boolean(stats)) => {
+            stats.min_opt().map(|val| Datum::bool(*val))
         }
-    }
+        (PrimitiveType::Int, Statistics::Int32(stats)) => {
+            stats.min_opt().map(|val| Datum::int(*val))
+        }
+        (PrimitiveType::Date, Statistics::Int32(stats)) => {
+            stats.min_opt().map(|val| Datum::date(*val))
+        }
+        (PrimitiveType::Long, Statistics::Int64(stats)) => {
+            stats.min_opt().map(|val| Datum::long(*val))
+        }
+        (PrimitiveType::Time, Statistics::Int64(stats)) => {
+            let Some(val) = stats.min_opt() else {
+                return Ok(None);
+            };
+
+            Some(Datum::time_micros(*val)?)
+        }
+        (PrimitiveType::Timestamp, Statistics::Int64(stats)) => {
+            stats.min_opt().map(|val| Datum::timestamp_micros(*val))
+        }
+        (PrimitiveType::Timestamptz, Statistics::Int64(stats)) => {
+            stats.min_opt().map(|val| Datum::timestamptz_micros(*val))
+        }
+        (PrimitiveType::TimestampNs, Statistics::Int64(stats)) => {
+            stats.min_opt().map(|val| Datum::timestamp_nanos(*val))
+        }
+        (PrimitiveType::TimestamptzNs, Statistics::Int64(stats)) => {
+            stats.min_opt().map(|val| Datum::timestamptz_nanos(*val))
+        }
+        (PrimitiveType::Float, Statistics::Float(stats)) => {
+            stats.min_opt().map(|val| Datum::float(*val))
+        }
+        (PrimitiveType::Double, Statistics::Double(stats)) => {
+            stats.min_opt().map(|val| Datum::double(*val))
+        }
+        (PrimitiveType::String, Statistics::ByteArray(stats)) => {
+            let Some(val) = stats.min_opt() else {
+                return Ok(None);
+            };
+
+            Some(Datum::string(val.as_utf8()?))
+        }
+        (
+            PrimitiveType::Decimal {
+                precision: _,
+                scale: _,
+            },
+            Statistics::ByteArray(stats),
+        ) => {
+            let Some(bytes) = stats.min_bytes_opt() else {
+                return Ok(None);
+            };
+            Some(Datum::new(
+                primitive_type.clone(),
+                PrimitiveLiteral::Int128(i128::from_be_bytes(bytes.try_into()?)),
+            ))
+        }
+        (
+            PrimitiveType::Decimal {
+                precision: _,
+                scale: _,
+            },
+            Statistics::FixedLenByteArray(stats),
+        ) => {
+            let Some(bytes) = stats.min_bytes_opt() else {
+                return Ok(None);
+            };
+            let unscaled_value = BigInt::from_signed_bytes_be(bytes);
+            Some(Datum::new(
+                primitive_type.clone(),
+                PrimitiveLiteral::Int128(unscaled_value.to_i128().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Can't convert bytes to i128: {bytes:?}"),
+                    )
+                })?),
+            ))
+        }
+        (
+            PrimitiveType::Decimal {
+                precision: _,
+                scale: _,
+            },
+            Statistics::Int32(stats),
+        ) => stats.min_opt().map(|val| {
+            Datum::new(
+                primitive_type.clone(),
+                PrimitiveLiteral::Int128(i128::from(*val)),
+            )
+        }),
+
+        (
+            PrimitiveType::Decimal {
+                precision: _,
+                scale: _,
+            },
+            Statistics::Int64(stats),
+        ) => stats.min_opt().map(|val| {
+            Datum::new(
+                primitive_type.clone(),
+                PrimitiveLiteral::Int128(i128::from(*val)),
+            )
+        }),
+        (PrimitiveType::Uuid, Statistics::FixedLenByteArray(stats)) => {
+            let Some(bytes) = stats.min_bytes_opt() else {
+                return Ok(None);
+            };
+            if bytes.len() != 16 {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    "Invalid length of uuid bytes.",
+                ));
+            }
+            Some(Datum::uuid(Uuid::from_bytes(
+                bytes[..16].try_into().unwrap(),
+            )))
+        }
+        (PrimitiveType::Fixed(len), Statistics::FixedLenByteArray(stat)) => {
+            let Some(bytes) = stat.min_bytes_opt() else {
+                return Ok(None);
+            };
+            if bytes.len() != *len as usize {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    "Invalid length of fixed bytes.",
+                ));
+            }
+            Some(Datum::fixed(bytes.to_vec()))
+        }
+        (PrimitiveType::Binary, Statistics::ByteArray(stat)) => {
+            return Ok(stat
+                .min_bytes_opt()
+                .map(|bytes| Datum::binary(bytes.to_vec())));
+        }
+        _ => {
+            return Ok(None);
+        }
+    })
 }
 
-get_parquet_stat_as_datum!(min);
+pub(crate) fn get_parquet_stat_max_as_datum(
+    primitive_type: &PrimitiveType,
+    stats: &Statistics,
+) -> Result<Option<Datum>> {
+    Ok(match (primitive_type, stats) {
+        (PrimitiveType::Boolean, Statistics::Boolean(stats)) => {
+            stats.max_opt().map(|val| Datum::bool(*val))
+        }
+        (PrimitiveType::Int, Statistics::Int32(stats)) => {
+            stats.max_opt().map(|val| Datum::int(*val))
+        }
+        (PrimitiveType::Date, Statistics::Int32(stats)) => {
+            stats.max_opt().map(|val| Datum::date(*val))
+        }
+        (PrimitiveType::Long, Statistics::Int64(stats)) => {
+            stats.max_opt().map(|val| Datum::long(*val))
+        }
+        (PrimitiveType::Time, Statistics::Int64(stats)) => {
+            let Some(val) = stats.max_opt() else {
+                return Ok(None);
+            };
 
-get_parquet_stat_as_datum!(max);
+            Some(Datum::time_micros(*val)?)
+        }
+        (PrimitiveType::Timestamp, Statistics::Int64(stats)) => {
+            stats.max_opt().map(|val| Datum::timestamp_micros(*val))
+        }
+        (PrimitiveType::Timestamptz, Statistics::Int64(stats)) => {
+            stats.max_opt().map(|val| Datum::timestamptz_micros(*val))
+        }
+        (PrimitiveType::TimestampNs, Statistics::Int64(stats)) => {
+            stats.max_opt().map(|val| Datum::timestamp_nanos(*val))
+        }
+        (PrimitiveType::TimestamptzNs, Statistics::Int64(stats)) => {
+            stats.max_opt().map(|val| Datum::timestamptz_nanos(*val))
+        }
+        (PrimitiveType::Float, Statistics::Float(stats)) => {
+            stats.max_opt().map(|val| Datum::float(*val))
+        }
+        (PrimitiveType::Double, Statistics::Double(stats)) => {
+            stats.max_opt().map(|val| Datum::double(*val))
+        }
+        (PrimitiveType::String, Statistics::ByteArray(stats)) => {
+            let Some(val) = stats.max_opt() else {
+                return Ok(None);
+            };
+
+            Some(Datum::string(val.as_utf8()?))
+        }
+        (
+            PrimitiveType::Decimal {
+                precision: _,
+                scale: _,
+            },
+            Statistics::ByteArray(stats),
+        ) => {
+            let Some(bytes) = stats.max_bytes_opt() else {
+                return Ok(None);
+            };
+            Some(Datum::new(
+                primitive_type.clone(),
+                PrimitiveLiteral::Int128(i128::from_be_bytes(bytes.try_into()?)),
+            ))
+        }
+        (
+            PrimitiveType::Decimal {
+                precision: _,
+                scale: _,
+            },
+            Statistics::FixedLenByteArray(stats),
+        ) => {
+            let Some(bytes) = stats.max_bytes_opt() else {
+                return Ok(None);
+            };
+            let unscaled_value = BigInt::from_signed_bytes_be(bytes);
+            Some(Datum::new(
+                primitive_type.clone(),
+                PrimitiveLiteral::Int128(unscaled_value.to_i128().ok_or_else(|| {
+                    Error::new(
+                        ErrorKind::DataInvalid,
+                        format!("Can't convert bytes to i128: {bytes:?}"),
+                    )
+                })?),
+            ))
+        }
+        (
+            PrimitiveType::Decimal {
+                precision: _,
+                scale: _,
+            },
+            Statistics::Int32(stats),
+        ) => stats.max_opt().map(|val| {
+            Datum::new(
+                primitive_type.clone(),
+                PrimitiveLiteral::Int128(i128::from(*val)),
+            )
+        }),
+
+        (
+            PrimitiveType::Decimal {
+                precision: _,
+                scale: _,
+            },
+            Statistics::Int64(stats),
+        ) => stats.max_opt().map(|val| {
+            Datum::new(
+                primitive_type.clone(),
+                PrimitiveLiteral::Int128(i128::from(*val)),
+            )
+        }),
+        (PrimitiveType::Uuid, Statistics::FixedLenByteArray(stats)) => {
+            let Some(bytes) = stats.max_bytes_opt() else {
+                return Ok(None);
+            };
+            if bytes.len() != 16 {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    "Invalid length of uuid bytes.",
+                ));
+            }
+            Some(Datum::uuid(Uuid::from_bytes(
+                bytes[..16].try_into().unwrap(),
+            )))
+        }
+        (PrimitiveType::Fixed(len), Statistics::FixedLenByteArray(stat)) => {
+            let Some(bytes) = stat.max_bytes_opt() else {
+                return Ok(None);
+            };
+            if bytes.len() != *len as usize {
+                return Err(Error::new(
+                    ErrorKind::Unexpected,
+                    "Invalid length of fixed bytes.",
+                ));
+            }
+            Some(Datum::fixed(bytes.to_vec()))
+        }
+        (PrimitiveType::Binary, Statistics::ByteArray(stat)) => {
+            return Ok(stat
+                .max_bytes_opt()
+                .map(|bytes| Datum::binary(bytes.to_vec())));
+        }
+        _ => {
+            return Ok(None);
+        }
+    })
+}
 
 impl TryFrom<&ArrowSchema> for crate::spec::Schema {
     type Error = Error;
@@ -812,6 +1022,7 @@ mod tests {
     use std::sync::Arc;
 
     use arrow_schema::{DataType, Field, Schema as ArrowSchema, TimeUnit};
+    use rust_decimal::Decimal;
 
     use super::*;
     use crate::spec::{Literal, Schema};
@@ -835,6 +1046,7 @@ mod tests {
             Arc::new(simple_field(DEFAULT_MAP_FIELD_NAME, r#struct, false, "17")),
             false,
         );
+        let dictionary = DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Utf8));
 
         let fields = Fields::from(vec![
             simple_field("aa", DataType::Int32, false, "18"),
@@ -914,6 +1126,7 @@ mod tests {
             ),
             simple_field("map", map, false, "16"),
             simple_field("struct", r#struct, false, "17"),
+            simple_field("dictionary", dictionary, false, "30"),
         ])
     }
 
@@ -1091,6 +1304,12 @@ mod tests {
                             }
                         ]
                     }
+                },
+                {
+                    "id":30,
+                    "name":"dictionary",
+                    "required":true,
+                    "type":"string"
                 }
             ],
             "identifier-field-ids":[]
@@ -1105,7 +1324,7 @@ mod tests {
         let arrow_schema = arrow_schema_for_arrow_schema_to_schema_test();
         let schema = iceberg_schema_for_arrow_schema_to_schema_test();
         let converted_schema = arrow_schema_to_schema(&arrow_schema).unwrap();
-        assert_eq!(converted_schema, schema);
+        pretty_assertions::assert_eq!(converted_schema, schema);
     }
 
     fn arrow_schema_for_schema_to_arrow_schema_test() -> ArrowSchema {
@@ -1484,6 +1703,168 @@ mod tests {
                 .into(),
             ]));
             assert_eq!(arrow_type, type_to_arrow_type(&iceberg_type).unwrap());
+        }
+
+        // test dictionary type
+        {
+            let arrow_type =
+                DataType::Dictionary(Box::new(DataType::Int32), Box::new(DataType::Int8));
+            let iceberg_type = Type::Primitive(PrimitiveType::Int);
+            assert_eq!(
+                iceberg_type,
+                arrow_type_to_type(&arrow_type).unwrap(),
+                "Expected dictionary conversion to use the contained value"
+            );
+
+            let arrow_type =
+                DataType::Dictionary(Box::new(DataType::Utf8), Box::new(DataType::Boolean));
+            let iceberg_type = Type::Primitive(PrimitiveType::Boolean);
+            assert_eq!(iceberg_type, arrow_type_to_type(&arrow_type).unwrap());
+        }
+    }
+
+    #[test]
+    fn test_unsigned_integer_type_conversion() {
+        let test_cases = vec![
+            (DataType::UInt8, PrimitiveType::Int),
+            (DataType::UInt16, PrimitiveType::Int),
+            (DataType::UInt32, PrimitiveType::Long),
+        ];
+
+        for (arrow_type, expected_iceberg_type) in test_cases {
+            let arrow_field = Field::new("test", arrow_type.clone(), false).with_metadata(
+                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+            );
+            let arrow_schema = ArrowSchema::new(vec![arrow_field]);
+
+            let iceberg_schema = arrow_schema_to_schema(&arrow_schema).unwrap();
+            let iceberg_field = iceberg_schema.as_struct().fields().first().unwrap();
+
+            assert!(
+                matches!(iceberg_field.field_type.as_ref(), Type::Primitive(t) if *t == expected_iceberg_type),
+                "Expected {arrow_type:?} to map to {expected_iceberg_type:?}"
+            );
+        }
+
+        // Test UInt64 blocking
+        {
+            let arrow_field = Field::new("test", DataType::UInt64, false).with_metadata(
+                HashMap::from([(PARQUET_FIELD_ID_META_KEY.to_string(), "1".to_string())]),
+            );
+            let arrow_schema = ArrowSchema::new(vec![arrow_field]);
+
+            let result = arrow_schema_to_schema(&arrow_schema);
+            assert!(result.is_err());
+            assert!(
+                result
+                    .unwrap_err()
+                    .to_string()
+                    .contains("UInt64 is not supported")
+            );
+        }
+    }
+
+    #[test]
+    fn test_datum_conversion() {
+        {
+            let datum = Datum::bool(true);
+            let arrow_datum = get_arrow_datum(&datum).unwrap();
+            let (array, is_scalar) = arrow_datum.get();
+            let array = array.as_any().downcast_ref::<BooleanArray>().unwrap();
+            assert!(is_scalar);
+            assert!(array.value(0));
+        }
+        {
+            let datum = Datum::int(42);
+            let arrow_datum = get_arrow_datum(&datum).unwrap();
+            let (array, is_scalar) = arrow_datum.get();
+            let array = array.as_any().downcast_ref::<Int32Array>().unwrap();
+            assert!(is_scalar);
+            assert_eq!(array.value(0), 42);
+        }
+        {
+            let datum = Datum::long(42);
+            let arrow_datum = get_arrow_datum(&datum).unwrap();
+            let (array, is_scalar) = arrow_datum.get();
+            let array = array.as_any().downcast_ref::<Int64Array>().unwrap();
+            assert!(is_scalar);
+            assert_eq!(array.value(0), 42);
+        }
+        {
+            let datum = Datum::float(42.42);
+            let arrow_datum = get_arrow_datum(&datum).unwrap();
+            let (array, is_scalar) = arrow_datum.get();
+            let array = array.as_any().downcast_ref::<Float32Array>().unwrap();
+            assert!(is_scalar);
+            assert_eq!(array.value(0), 42.42);
+        }
+        {
+            let datum = Datum::double(42.42);
+            let arrow_datum = get_arrow_datum(&datum).unwrap();
+            let (array, is_scalar) = arrow_datum.get();
+            let array = array.as_any().downcast_ref::<Float64Array>().unwrap();
+            assert!(is_scalar);
+            assert_eq!(array.value(0), 42.42);
+        }
+        {
+            let datum = Datum::string("abc");
+            let arrow_datum = get_arrow_datum(&datum).unwrap();
+            let (array, is_scalar) = arrow_datum.get();
+            let array = array.as_any().downcast_ref::<StringArray>().unwrap();
+            assert!(is_scalar);
+            assert_eq!(array.value(0), "abc");
+        }
+        {
+            let datum = Datum::date(42);
+            let arrow_datum = get_arrow_datum(&datum).unwrap();
+            let (array, is_scalar) = arrow_datum.get();
+            let array = array.as_any().downcast_ref::<Date32Array>().unwrap();
+            assert!(is_scalar);
+            assert_eq!(array.value(0), 42);
+        }
+        {
+            let datum = Datum::timestamp_micros(42);
+            let arrow_datum = get_arrow_datum(&datum).unwrap();
+            let (array, is_scalar) = arrow_datum.get();
+            let array = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            assert!(is_scalar);
+            assert_eq!(array.value(0), 42);
+        }
+        {
+            let datum = Datum::timestamptz_micros(42);
+            let arrow_datum = get_arrow_datum(&datum).unwrap();
+            let (array, is_scalar) = arrow_datum.get();
+            let array = array
+                .as_any()
+                .downcast_ref::<TimestampMicrosecondArray>()
+                .unwrap();
+            assert!(is_scalar);
+            assert_eq!(array.timezone(), Some("+00:00"));
+            assert_eq!(array.value(0), 42);
+        }
+        {
+            let datum = Datum::decimal_with_precision(Decimal::new(123, 2), 30).unwrap();
+            let arrow_datum = get_arrow_datum(&datum).unwrap();
+            let (array, is_scalar) = arrow_datum.get();
+            let array = array.as_any().downcast_ref::<Decimal128Array>().unwrap();
+            assert!(is_scalar);
+            assert_eq!(array.precision(), 30);
+            assert_eq!(array.scale(), 2);
+            assert_eq!(array.value(0), 123);
+        }
+        {
+            let datum = Datum::uuid_from_str("42424242-4242-4242-4242-424242424242").unwrap();
+            let arrow_datum = get_arrow_datum(&datum).unwrap();
+            let (array, is_scalar) = arrow_datum.get();
+            let array = array
+                .as_any()
+                .downcast_ref::<FixedSizeBinaryArray>()
+                .unwrap();
+            assert!(is_scalar);
+            assert_eq!(array.value(0), [66u8; 16]);
         }
     }
 }

@@ -16,12 +16,16 @@
 // under the License.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
-use opendal::raw::HttpClient;
+use async_trait::async_trait;
 use opendal::services::S3Config;
 use opendal::{Configurator, Operator};
+pub use reqsign::{AwsCredential, AwsCredentialLoad};
+use reqwest::Client;
 use url::Url;
 
+use crate::io::is_truthy;
 use crate::{Error, ErrorKind, Result};
 
 /// Following are arguments for [s3 file io](https://py.iceberg.apache.org/configuration/#s3).
@@ -58,6 +62,13 @@ pub const S3_ASSUME_ROLE_ARN: &str = "client.assume-role.arn";
 pub const S3_ASSUME_ROLE_EXTERNAL_ID: &str = "client.assume-role.external-id";
 /// Optional session name used to assume an IAM role.
 pub const S3_ASSUME_ROLE_SESSION_NAME: &str = "client.assume-role.session-name";
+/// Option to skip signing requests (e.g. for public buckets/folders).
+pub const S3_ALLOW_ANONYMOUS: &str = "s3.allow-anonymous";
+/// Option to skip loading the credential from EC2 metadata (typically used in conjunction with
+/// `S3_ALLOW_ANONYMOUS`).
+pub const S3_DISABLE_EC2_METADATA: &str = "s3.disable-ec2-metadata";
+/// Option to skip loading configuration from config file and the env.
+pub const S3_DISABLE_CONFIG_LOAD: &str = "s3.disable-config-load";
 
 /// Parse iceberg props to s3 config.
 pub(crate) fn s3_config_parse(mut m: HashMap<String, String>) -> Result<S3Config> {
@@ -81,9 +92,7 @@ pub(crate) fn s3_config_parse(mut m: HashMap<String, String>) -> Result<S3Config
         cfg.region = Some(region);
     };
     if let Some(path_style_access) = m.remove(S3_PATH_STYLE_ACCESS) {
-        if ["true", "True", "1"].contains(&path_style_access.as_str()) {
-            cfg.enable_virtual_host_style = true;
-        }
+        cfg.enable_virtual_host_style = !is_truthy(path_style_access.to_lowercase().as_str());
     };
     if let Some(arn) = m.remove(S3_ASSUME_ROLE_ARN) {
         cfg.role_arn = Some(arn);
@@ -118,11 +127,26 @@ pub(crate) fn s3_config_parse(mut m: HashMap<String, String>) -> Result<S3Config
                 return Err(Error::new(
                     ErrorKind::DataInvalid,
                     format!(
-                        "Invalid {}: {}. Expected one of (custom, kms, s3, none)",
-                        S3_SSE_TYPE, sse_type
+                        "Invalid {S3_SSE_TYPE}: {sse_type}. Expected one of (custom, kms, s3, none)"
                     ),
                 ));
             }
+        }
+    };
+
+    if let Some(allow_anonymous) = m.remove(S3_ALLOW_ANONYMOUS) {
+        if is_truthy(allow_anonymous.to_lowercase().as_str()) {
+            cfg.allow_anonymous = true;
+        }
+    }
+    if let Some(disable_ec2_metadata) = m.remove(S3_DISABLE_EC2_METADATA) {
+        if is_truthy(disable_ec2_metadata.to_lowercase().as_str()) {
+            cfg.disable_ec2_metadata = true;
+        }
+    };
+    if let Some(disable_config_load) = m.remove(S3_DISABLE_CONFIG_LOAD) {
+        if is_truthy(disable_config_load.to_lowercase().as_str()) {
+            cfg.disable_config_load = true;
         }
     };
 
@@ -131,25 +155,61 @@ pub(crate) fn s3_config_parse(mut m: HashMap<String, String>) -> Result<S3Config
 
 /// Build new opendal operator from give path.
 pub(crate) fn s3_config_build(
-    client: &reqwest::Client,
     cfg: &S3Config,
+    customized_credential_load: &Option<CustomAwsCredentialLoader>,
     path: &str,
 ) -> Result<Operator> {
     let url = Url::parse(path)?;
     let bucket = url.host_str().ok_or_else(|| {
         Error::new(
             ErrorKind::DataInvalid,
-            format!("Invalid s3 url: {}, missing bucket", path),
+            format!("Invalid s3 url: {path}, missing bucket"),
         )
     })?;
 
-    let builder = cfg
+    let mut builder = cfg
         .clone()
         .into_builder()
         // Set bucket name.
-        .bucket(bucket)
-        // Set http client we want to use.
-        .http_client(HttpClient::with(client.clone()));
+        .bucket(bucket);
+
+    if let Some(customized_credential_load) = customized_credential_load {
+        builder = builder
+            .customized_credential_load(customized_credential_load.clone().into_opendal_loader());
+    }
 
     Ok(Operator::new(builder)?.finish())
+}
+
+/// Custom AWS credential loader.
+/// This can be used to load credentials from a custom source, such as the AWS SDK.
+///
+/// This should be set as an extension on `FileIOBuilder`.
+#[derive(Clone)]
+pub struct CustomAwsCredentialLoader(Arc<dyn AwsCredentialLoad>);
+
+impl std::fmt::Debug for CustomAwsCredentialLoader {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CustomAwsCredentialLoader")
+            .finish_non_exhaustive()
+    }
+}
+
+impl CustomAwsCredentialLoader {
+    /// Create a new custom AWS credential loader.
+    pub fn new(loader: Arc<dyn AwsCredentialLoad>) -> Self {
+        Self(loader)
+    }
+
+    /// Convert this loader into an opendal compatible loader for customized AWS credentials.
+    pub fn into_opendal_loader(self) -> Box<dyn AwsCredentialLoad> {
+        Box::new(self)
+    }
+}
+
+#[async_trait]
+impl AwsCredentialLoad for CustomAwsCredentialLoader {
+    async fn load_credential(&self, client: Client) -> anyhow::Result<Option<AwsCredential>> {
+        self.0.load_credential(client).await
+    }
 }

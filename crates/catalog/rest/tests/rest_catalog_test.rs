@@ -23,13 +23,14 @@ use std::sync::RwLock;
 
 use ctor::{ctor, dtor};
 use iceberg::spec::{FormatVersion, NestedField, PrimitiveType, Schema, Type};
-use iceberg::transaction::Transaction;
-use iceberg::{Catalog, Namespace, NamespaceIdent, TableCreation, TableIdent};
-use iceberg_catalog_rest::{RestCatalog, RestCatalogConfig};
+use iceberg::transaction::{ApplyTransactionAction, Transaction};
+use iceberg::{Catalog, CatalogBuilder, Namespace, NamespaceIdent, TableCreation, TableIdent};
+use iceberg_catalog_rest::{REST_CATALOG_PROP_URI, RestCatalog, RestCatalogBuilder};
 use iceberg_test_utils::docker::DockerCompose;
 use iceberg_test_utils::{normalize_test_name, set_up};
 use port_scanner::scan_port_addr;
 use tokio::time::sleep;
+use tracing::info;
 
 const REST_CATALOG_PORT: u16 = 8181;
 static DOCKER_COMPOSE_ENV: RwLock<Option<DockerCompose>> = RwLock::new(None);
@@ -41,7 +42,7 @@ fn before_all() {
         normalize_test_name(module_path!()),
         format!("{}/testdata/rest_catalog", env!("CARGO_MANIFEST_DIR")),
     );
-    docker_compose.run();
+    docker_compose.up();
     guard.replace(docker_compose);
 }
 
@@ -62,14 +63,20 @@ async fn get_catalog() -> RestCatalog {
 
     let rest_socket_addr = SocketAddr::new(rest_catalog_ip, REST_CATALOG_PORT);
     while !scan_port_addr(rest_socket_addr) {
-        log::info!("Waiting for 1s rest catalog to ready...");
+        info!("Waiting for 1s rest catalog to ready...");
         sleep(std::time::Duration::from_millis(1000)).await;
     }
 
-    let config = RestCatalogConfig::builder()
-        .uri(format!("http://{}", rest_socket_addr))
-        .build();
-    RestCatalog::new(config)
+    RestCatalogBuilder::default()
+        .load(
+            "rest",
+            HashMap::from([(
+                REST_CATALOG_PROP_URI.to_string(),
+                format!("http://{rest_socket_addr}"),
+            )]),
+        )
+        .await
+        .unwrap()
 }
 
 #[tokio::test]
@@ -81,10 +88,7 @@ async fn test_get_non_exist_namespace() {
         .await;
 
     assert!(result.is_err());
-    assert!(result
-        .unwrap_err()
-        .to_string()
-        .contains("Namespace does not exist"));
+    assert!(result.unwrap_err().to_string().contains("does not exist"));
 }
 
 #[tokio::test]
@@ -138,12 +142,14 @@ async fn test_list_namespace() {
     );
 
     // Currently this namespace doesn't exist, so it should return error.
-    assert!(catalog
-        .list_namespaces(Some(
-            &NamespaceIdent::from_strs(["test_list_namespace"]).unwrap()
-        ))
-        .await
-        .is_err());
+    assert!(
+        catalog
+            .list_namespaces(Some(
+                &NamespaceIdent::from_strs(["test_list_namespace"]).unwrap()
+            ))
+            .await
+            .is_err()
+    );
 
     // Create namespaces
     catalog
@@ -180,10 +186,12 @@ async fn test_list_empty_namespace() {
     );
 
     // Currently this namespace doesn't exist, so it should return error.
-    assert!(catalog
-        .list_namespaces(Some(ns_apple.name()))
-        .await
-        .is_err());
+    assert!(
+        catalog
+            .list_namespaces(Some(ns_apple.name()))
+            .await
+            .is_err()
+    );
 
     // Create namespaces
     catalog
@@ -220,12 +228,14 @@ async fn test_list_root_namespace() {
     );
 
     // Currently this namespace doesn't exist, so it should return error.
-    assert!(catalog
-        .list_namespaces(Some(
-            &NamespaceIdent::from_strs(["test_list_root_namespace"]).unwrap()
-        ))
-        .await
-        .is_err());
+    assert!(
+        catalog
+            .list_namespaces(Some(
+                &NamespaceIdent::from_strs(["test_list_root_namespace"]).unwrap()
+            ))
+            .await
+            .is_err()
+    );
 
     // Create namespaces
     catalog
@@ -342,9 +352,12 @@ async fn test_update_table() {
         &TableIdent::new(ns.name().clone(), "t1".to_string())
     );
 
+    let tx = Transaction::new(&table);
     // Update table by committing transaction
-    let table2 = Transaction::new(&table)
-        .set_properties(HashMap::from([("prop1".to_string(), "v1".to_string())]))
+    let table2 = tx
+        .update_table_properties()
+        .set("prop1".to_string(), "v1".to_string())
+        .apply(tx)
         .unwrap()
         .commit(&catalog)
         .await
@@ -377,10 +390,12 @@ async fn test_list_empty_multi_level_namespace() {
     );
 
     // Currently this namespace doesn't exist, so it should return error.
-    assert!(catalog
-        .list_namespaces(Some(ns_apple.name()))
-        .await
-        .is_err());
+    assert!(
+        catalog
+            .list_namespaces(Some(ns_apple.name()))
+            .await
+            .is_err()
+    );
 
     // Create namespaces
     catalog
@@ -397,4 +412,40 @@ async fn test_list_empty_multi_level_namespace() {
         .await
         .unwrap();
     assert!(nss.is_empty());
+}
+
+#[tokio::test]
+async fn test_register_table() {
+    let catalog = get_catalog().await;
+
+    // Create namespace
+    let ns = NamespaceIdent::from_strs(["ns"]).unwrap();
+    catalog.create_namespace(&ns, HashMap::new()).await.unwrap();
+
+    // Create the table, store the metadata location, drop the table
+    let empty_schema = Schema::builder().build().unwrap();
+    let table_creation = TableCreation::builder()
+        .name("t1".to_string())
+        .schema(empty_schema)
+        .build();
+
+    let table = catalog.create_table(&ns, table_creation).await.unwrap();
+
+    let metadata_location = table.metadata_location().unwrap();
+    catalog.drop_table(table.identifier()).await.unwrap();
+
+    let new_table_identifier = TableIdent::from_strs(["ns", "t2"]).unwrap();
+    let table_registered = catalog
+        .register_table(&new_table_identifier, metadata_location.to_string())
+        .await
+        .unwrap();
+
+    assert_eq!(
+        table.metadata_location(),
+        table_registered.metadata_location()
+    );
+    assert_ne!(
+        table.identifier().to_string(),
+        table_registered.identifier().to_string()
+    );
 }

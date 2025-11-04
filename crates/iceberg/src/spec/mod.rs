@@ -18,26 +18,38 @@
 //! Spec for Iceberg.
 
 mod datatypes;
+mod encrypted_key;
 mod manifest;
 mod manifest_list;
+mod name_mapping;
 mod partition;
 mod schema;
 mod snapshot;
+mod snapshot_summary;
 mod sort;
+mod statistic_file;
 mod table_metadata;
+mod table_metadata_builder;
+mod table_properties;
 mod transform;
 mod values;
 mod view_metadata;
+mod view_metadata_builder;
 mod view_version;
 
 pub use datatypes::*;
+pub use encrypted_key::*;
 pub use manifest::*;
 pub use manifest_list::*;
+pub use name_mapping::*;
 pub use partition::*;
 pub use schema::*;
 pub use snapshot::*;
+pub use snapshot_summary::*;
 pub use sort::*;
+pub use statistic_file::*;
 pub use table_metadata::*;
+pub use table_properties::*;
 pub use transform::*;
 pub use values::*;
 pub use view_metadata::*;

@@ -17,31 +17,42 @@
 
 //! Catalog API for Apache Iceberg
 
+pub mod memory;
+mod metadata_location;
+
 use std::collections::HashMap;
-use std::fmt::Debug;
+use std::fmt::{Debug, Display};
+use std::future::Future;
 use std::mem::take;
 use std::ops::Deref;
+use std::str::FromStr;
+use std::sync::Arc;
 
 use _serde::deserialize_snapshot;
 use async_trait::async_trait;
+pub use memory::MemoryCatalog;
+pub use metadata_location::*;
+#[cfg(test)]
+use mockall::automock;
 use serde_derive::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 use uuid::Uuid;
 
 use crate::spec::{
-    FormatVersion, Schema, SchemaId, Snapshot, SnapshotReference, SortOrder, TableMetadata,
-    TableMetadataBuilder, UnboundPartitionSpec, ViewFormatVersion, ViewRepresentations,
-    ViewVersion,
+    FormatVersion, PartitionStatisticsFile, Schema, SchemaId, Snapshot, SnapshotReference,
+    SortOrder, StatisticsFile, TableMetadata, TableMetadataBuilder, UnboundPartitionSpec,
+    ViewFormatVersion, ViewRepresentations, ViewVersion,
 };
 use crate::table::Table;
 use crate::{Error, ErrorKind, Result};
 
 /// The catalog API for Iceberg Rust.
 #[async_trait]
+#[cfg_attr(test, automock)]
 pub trait Catalog: Debug + Sync + Send {
     /// List namespaces inside the catalog.
     async fn list_namespaces(&self, parent: Option<&NamespaceIdent>)
-        -> Result<Vec<NamespaceIdent>>;
+    -> Result<Vec<NamespaceIdent>>;
 
     /// Create a new namespace inside the catalog.
     async fn create_namespace(
@@ -67,7 +78,7 @@ pub trait Catalog: Debug + Sync + Send {
         properties: HashMap<String, String>,
     ) -> Result<()>;
 
-    /// Drop a namespace from the catalog.
+    /// Drop a namespace from the catalog, or returns error if it doesn't exist.
     async fn drop_namespace(&self, namespace: &NamespaceIdent) -> Result<()>;
 
     /// List tables from namespace.
@@ -83,7 +94,7 @@ pub trait Catalog: Debug + Sync + Send {
     /// Load table from the catalog.
     async fn load_table(&self, table: &TableIdent) -> Result<Table>;
 
-    /// Drop a table from the catalog.
+    /// Drop a table from the catalog, or returns error if it doesn't exist.
     async fn drop_table(&self, table: &TableIdent) -> Result<()>;
 
     /// Check if a table exists in the catalog.
@@ -92,14 +103,29 @@ pub trait Catalog: Debug + Sync + Send {
     /// Rename a table in the catalog.
     async fn rename_table(&self, src: &TableIdent, dest: &TableIdent) -> Result<()>;
 
+    /// Register an existing table to the catalog.
+    async fn register_table(&self, table: &TableIdent, metadata_location: String) -> Result<Table>;
+
     /// Update a table to the catalog.
     async fn update_table(&self, commit: TableCommit) -> Result<Table>;
+}
+
+/// Common interface for all catalog builders.
+pub trait CatalogBuilder: Default + Debug + Send + Sync {
+    /// The catalog type that this builder creates.
+    type C: Catalog;
+    /// Create a new catalog instance.
+    fn load(
+        self,
+        name: impl Into<String>,
+        props: HashMap<String, String>,
+    ) -> impl Future<Output = Result<Self::C>> + Send;
 }
 
 /// NamespaceIdent represents the identifier of a namespace in the catalog.
 ///
 /// The namespace identifier is a list of strings, where each string is a
-/// component of the namespace. It's catalog implementer's responsibility to
+/// component of the namespace. It's the catalog implementer's responsibility to
 /// handle the namespace identifier correctly.
 #[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash, PartialOrd, Ord)]
 pub struct NamespaceIdent(Vec<String>);
@@ -192,8 +218,14 @@ impl Namespace {
     }
 }
 
+impl Display for NamespaceIdent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.0.join("."))
+    }
+}
+
 /// TableIdent represents the identifier of a table in the catalog.
-#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, Hash)]
+#[derive(Serialize, Deserialize, Debug, Clone, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub struct TableIdent {
     /// Namespace of the table.
     pub namespace: NamespaceIdent,
@@ -232,28 +264,40 @@ impl TableIdent {
     }
 }
 
+impl Display for TableIdent {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}.{}", self.namespace, self.name)
+    }
+}
+
 /// TableCreation represents the creation of a table in the catalog.
 #[derive(Debug, TypedBuilder)]
 pub struct TableCreation {
     /// The name of the table.
     pub name: String,
     /// The location of the table.
-    #[builder(default, setter(strip_option))]
+    #[builder(default, setter(strip_option(fallback = location_opt)))]
     pub location: Option<String>,
     /// The schema of the table.
     pub schema: Schema,
     /// The partition spec of the table, could be None.
-    #[builder(default, setter(strip_option, into))]
+    #[builder(default, setter(strip_option(fallback = partition_spec_opt), into))]
     pub partition_spec: Option<UnboundPartitionSpec>,
     /// The sort order of the table.
-    #[builder(default, setter(strip_option))]
+    #[builder(default, setter(strip_option(fallback = sort_order_opt)))]
     pub sort_order: Option<SortOrder>,
     /// The properties of the table.
-    #[builder(default)]
+    #[builder(default, setter(transform = |props: impl IntoIterator<Item=(String, String)>| {
+        props.into_iter().collect()
+    }))]
     pub properties: HashMap<String, String>,
 }
 
 /// TableCommit represents the commit of a table in the catalog.
+///
+/// The builder is marked as private since it's dangerous and error-prone to construct
+/// [`TableCommit`] directly.
+/// Users are supposed to use [`crate::transaction::Transaction`] to update table.
 #[derive(Debug, TypedBuilder)]
 #[builder(build_method(vis = "pub(crate)"))]
 pub struct TableCommit {
@@ -282,10 +326,43 @@ impl TableCommit {
     pub fn take_updates(&mut self) -> Vec<TableUpdate> {
         take(&mut self.updates)
     }
+
+    /// Applies this [`TableCommit`] to the given [`Table`] as part of a catalog update.
+    /// Typically used by [`Catalog::update_table`] to validate requirements and apply metadata updates.
+    ///
+    /// Returns a new [`Table`] with updated metadata,
+    /// or an error if validation or application fails.
+    pub fn apply(self, table: Table) -> Result<Table> {
+        // check requirements
+        for requirement in self.requirements {
+            requirement.check(Some(table.metadata()))?;
+        }
+
+        // get current metadata location
+        let current_metadata_location = table.metadata_location_result()?;
+
+        // apply updates to metadata builder
+        let mut metadata_builder = table
+            .metadata()
+            .clone()
+            .into_builder(Some(current_metadata_location.to_string()));
+        for update in self.updates {
+            metadata_builder = update.apply(metadata_builder)?;
+        }
+
+        // Bump the version of metadata
+        let new_metadata_location = MetadataLocation::from_str(current_metadata_location)?
+            .with_next_version()
+            .to_string();
+
+        Ok(table
+            .with_metadata(Arc::new(metadata_builder.build()?.metadata))
+            .with_metadata_location(new_metadata_location))
+    }
 }
 
 /// TableRequirement represents a requirement for a table in the catalog.
-#[derive(Debug, Serialize, Deserialize, PartialEq)]
+#[derive(Clone, Debug, Serialize, Deserialize, PartialEq)]
 #[serde(tag = "type")]
 pub enum TableRequirement {
     /// The table must not already exist; used for create transactions
@@ -349,6 +426,7 @@ pub enum TableRequirement {
 /// TableUpdate represents an update to a table in the catalog.
 #[derive(Debug, Serialize, Deserialize, PartialEq, Clone)]
 #[serde(tag = "action", rename_all = "kebab-case")]
+#[allow(clippy::large_enum_variant)]
 pub enum TableUpdate {
     /// Upgrade table's format version
     #[serde(rename_all = "kebab-case")]
@@ -367,8 +445,6 @@ pub enum TableUpdate {
     AddSchema {
         /// The schema to add.
         schema: Schema,
-        /// The last column id of the table.
-        last_column_id: Option<i32>,
     },
     /// Set table's current schema
     #[serde(rename_all = "kebab-case")]
@@ -442,14 +518,86 @@ pub enum TableUpdate {
         /// Properties to remove
         removals: Vec<String>,
     },
+    /// Remove partition specs
+    #[serde(rename_all = "kebab-case")]
+    RemovePartitionSpecs {
+        /// Partition spec ids to remove.
+        spec_ids: Vec<i32>,
+    },
+    /// Set statistics for a snapshot
+    #[serde(with = "_serde_set_statistics")]
+    SetStatistics {
+        /// File containing the statistics
+        statistics: StatisticsFile,
+    },
+    /// Remove statistics for a snapshot
+    #[serde(rename_all = "kebab-case")]
+    RemoveStatistics {
+        /// Snapshot id to remove statistics for.
+        snapshot_id: i64,
+    },
+    /// Set partition statistics for a snapshot
+    #[serde(rename_all = "kebab-case")]
+    SetPartitionStatistics {
+        /// File containing the partition statistics
+        partition_statistics: PartitionStatisticsFile,
+    },
+    /// Remove partition statistics for a snapshot
+    #[serde(rename_all = "kebab-case")]
+    RemovePartitionStatistics {
+        /// Snapshot id to remove partition statistics for.
+        snapshot_id: i64,
+    },
+    /// Remove schemas
+    #[serde(rename_all = "kebab-case")]
+    RemoveSchemas {
+        /// Schema IDs to remove.
+        schema_ids: Vec<i32>,
+    },
 }
 
 impl TableUpdate {
     /// Applies the update to the table metadata builder.
     pub fn apply(self, builder: TableMetadataBuilder) -> Result<TableMetadataBuilder> {
         match self {
-            TableUpdate::AssignUuid { uuid } => builder.assign_uuid(uuid),
-            _ => unimplemented!(),
+            TableUpdate::AssignUuid { uuid } => Ok(builder.assign_uuid(uuid)),
+            TableUpdate::AddSchema { schema, .. } => Ok(builder.add_schema(schema)?),
+            TableUpdate::SetCurrentSchema { schema_id } => builder.set_current_schema(schema_id),
+            TableUpdate::AddSpec { spec } => builder.add_partition_spec(spec),
+            TableUpdate::SetDefaultSpec { spec_id } => builder.set_default_partition_spec(spec_id),
+            TableUpdate::AddSortOrder { sort_order } => builder.add_sort_order(sort_order),
+            TableUpdate::SetDefaultSortOrder { sort_order_id } => {
+                builder.set_default_sort_order(sort_order_id)
+            }
+            TableUpdate::AddSnapshot { snapshot } => builder.add_snapshot(snapshot),
+            TableUpdate::SetSnapshotRef {
+                ref_name,
+                reference,
+            } => builder.set_ref(&ref_name, reference),
+            TableUpdate::RemoveSnapshots { snapshot_ids } => {
+                Ok(builder.remove_snapshots(&snapshot_ids))
+            }
+            TableUpdate::RemoveSnapshotRef { ref_name } => Ok(builder.remove_ref(&ref_name)),
+            TableUpdate::SetLocation { location } => Ok(builder.set_location(location)),
+            TableUpdate::SetProperties { updates } => builder.set_properties(updates),
+            TableUpdate::RemoveProperties { removals } => builder.remove_properties(&removals),
+            TableUpdate::UpgradeFormatVersion { format_version } => {
+                builder.upgrade_format_version(format_version)
+            }
+            TableUpdate::RemovePartitionSpecs { spec_ids } => {
+                builder.remove_partition_specs(&spec_ids)
+            }
+            TableUpdate::SetStatistics { statistics } => Ok(builder.set_statistics(statistics)),
+            TableUpdate::RemoveStatistics { snapshot_id } => {
+                Ok(builder.remove_statistics(snapshot_id))
+            }
+            TableUpdate::SetPartitionStatistics {
+                partition_statistics,
+            } => Ok(builder.set_partition_statistics(partition_statistics)),
+            TableUpdate::RemovePartitionStatistics { snapshot_id } => {
+                Ok(builder.remove_partition_statistics(snapshot_id))
+            }
+            TableUpdate::RemoveSchemas { schema_ids } => builder.remove_schemas(&schema_ids),
         }
     }
 }
@@ -464,32 +612,35 @@ impl TableRequirement {
             match self {
                 TableRequirement::NotExist => {
                     return Err(Error::new(
-                        ErrorKind::DataInvalid,
+                        ErrorKind::CatalogCommitConflicts,
                         format!(
                             "Requirement failed: Table with id {} already exists",
                             metadata.uuid()
                         ),
-                    ));
+                    )
+                    .with_retryable(true));
                 }
                 TableRequirement::UuidMatch { uuid } => {
                     if &metadata.uuid() != uuid {
                         return Err(Error::new(
-                            ErrorKind::DataInvalid,
+                            ErrorKind::CatalogCommitConflicts,
                             "Requirement failed: Table UUID does not match",
                         )
                         .with_context("expected", *uuid)
-                        .with_context("found", metadata.uuid()));
+                        .with_context("found", metadata.uuid())
+                        .with_retryable(true));
                     }
                 }
                 TableRequirement::CurrentSchemaIdMatch { current_schema_id } => {
                     // ToDo: Harmonize the types of current_schema_id
                     if metadata.current_schema_id != *current_schema_id {
                         return Err(Error::new(
-                            ErrorKind::DataInvalid,
+                            ErrorKind::CatalogCommitConflicts,
                             "Requirement failed: Current schema id does not match",
                         )
                         .with_context("expected", current_schema_id.to_string())
-                        .with_context("found", metadata.current_schema_id.to_string()));
+                        .with_context("found", metadata.current_schema_id.to_string())
+                        .with_retryable(true));
                     }
                 }
                 TableRequirement::DefaultSortOrderIdMatch {
@@ -497,54 +648,54 @@ impl TableRequirement {
                 } => {
                     if metadata.default_sort_order().order_id != *default_sort_order_id {
                         return Err(Error::new(
-                            ErrorKind::DataInvalid,
+                            ErrorKind::CatalogCommitConflicts,
                             "Requirement failed: Default sort order id does not match",
                         )
                         .with_context("expected", default_sort_order_id.to_string())
-                        .with_context(
-                            "found",
-                            metadata.default_sort_order().order_id.to_string(),
-                        ));
+                        .with_context("found", metadata.default_sort_order().order_id.to_string())
+                        .with_retryable(true));
                     }
                 }
                 TableRequirement::RefSnapshotIdMatch { r#ref, snapshot_id } => {
                     let snapshot_ref = metadata.snapshot_for_ref(r#ref);
                     if let Some(snapshot_id) = snapshot_id {
-                        let snapshot_ref = snapshot_ref.ok_or(Error::new(
-                            ErrorKind::DataInvalid,
-                            format!("Requirement failed: Branch or tag `{}` not found", r#ref),
-                        ))?;
+                        let snapshot_ref = snapshot_ref.ok_or(
+                            Error::new(
+                                ErrorKind::CatalogCommitConflicts,
+                                format!("Requirement failed: Branch or tag `{ref}` not found"),
+                            )
+                            .with_retryable(true),
+                        )?;
                         if snapshot_ref.snapshot_id() != *snapshot_id {
                             return Err(Error::new(
-                                ErrorKind::DataInvalid,
+                                ErrorKind::CatalogCommitConflicts,
                                 format!(
-                                    "Requirement failed: Branch or tag `{}`'s snapshot has changed",
-                                    r#ref
+                                    "Requirement failed: Branch or tag `{ref}`'s snapshot has changed"
                                 ),
                             )
                             .with_context("expected", snapshot_id.to_string())
-                            .with_context("found", snapshot_ref.snapshot_id().to_string()));
+                            .with_context("found", snapshot_ref.snapshot_id().to_string())
+                            .with_retryable(true));
                         }
                     } else if snapshot_ref.is_some() {
                         // a null snapshot ID means the ref should not exist already
                         return Err(Error::new(
-                            ErrorKind::DataInvalid,
-                            format!(
-                                "Requirement failed: Branch or tag `{}` already exists",
-                                r#ref
-                            ),
-                        ));
+                            ErrorKind::CatalogCommitConflicts,
+                            format!("Requirement failed: Branch or tag `{ref}` already exists"),
+                        )
+                        .with_retryable(true));
                     }
                 }
                 TableRequirement::DefaultSpecIdMatch { default_spec_id } => {
                     // ToDo: Harmonize the types of default_spec_id
                     if metadata.default_partition_spec_id() != *default_spec_id {
                         return Err(Error::new(
-                            ErrorKind::DataInvalid,
+                            ErrorKind::CatalogCommitConflicts,
                             "Requirement failed: Default partition spec id does not match",
                         )
                         .with_context("expected", default_spec_id.to_string())
-                        .with_context("found", metadata.default_partition_spec_id().to_string()));
+                        .with_context("found", metadata.default_partition_spec_id().to_string())
+                        .with_retryable(true));
                     }
                 }
                 TableRequirement::LastAssignedPartitionIdMatch {
@@ -552,11 +703,12 @@ impl TableRequirement {
                 } => {
                     if metadata.last_partition_id != *last_assigned_partition_id {
                         return Err(Error::new(
-                            ErrorKind::DataInvalid,
+                            ErrorKind::CatalogCommitConflicts,
                             "Requirement failed: Last assigned partition id does not match",
                         )
                         .with_context("expected", last_assigned_partition_id.to_string())
-                        .with_context("found", metadata.last_partition_id.to_string()));
+                        .with_context("found", metadata.last_partition_id.to_string())
+                        .with_retryable(true));
                     }
                 }
                 TableRequirement::LastAssignedFieldIdMatch {
@@ -564,11 +716,12 @@ impl TableRequirement {
                 } => {
                     if &metadata.last_column_id != last_assigned_field_id {
                         return Err(Error::new(
-                            ErrorKind::DataInvalid,
+                            ErrorKind::CatalogCommitConflicts,
                             "Requirement failed: Last assigned field id does not match",
                         )
                         .with_context("expected", last_assigned_field_id.to_string())
-                        .with_context("found", metadata.last_column_id.to_string()));
+                        .with_context("found", metadata.last_column_id.to_string())
+                        .with_retryable(true));
                     }
                 }
             };
@@ -577,7 +730,7 @@ impl TableRequirement {
                 TableRequirement::NotExist => {}
                 _ => {
                     return Err(Error::new(
-                        ErrorKind::DataInvalid,
+                        ErrorKind::TableNotFound,
                         "Requirement failed: Table does not exist",
                     ));
                 }
@@ -675,12 +828,13 @@ pub struct ViewCreation {
 /// ViewUpdate represents an update to a view in the catalog.
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "action", rename_all = "kebab-case")]
+#[allow(clippy::large_enum_variant)]
 pub enum ViewUpdate {
     /// Assign a new UUID to the view
     #[serde(rename_all = "kebab-case")]
     AssignUuid {
         /// The new UUID to assign.
-        uuid: uuid::Uuid,
+        uuid: Uuid,
     },
     /// Upgrade view's format version
     #[serde(rename_all = "kebab-case")]
@@ -730,24 +884,78 @@ pub enum ViewUpdate {
     },
 }
 
+mod _serde_set_statistics {
+    // The rest spec requires an additional field `snapshot-id`
+    // that is redundant with the `snapshot_id` field in the statistics file.
+    use serde::{Deserialize, Deserializer, Serialize, Serializer};
+
+    use super::*;
+
+    #[derive(Debug, Serialize, Deserialize)]
+    #[serde(rename_all = "kebab-case")]
+    struct SetStatistics {
+        snapshot_id: Option<i64>,
+        statistics: StatisticsFile,
+    }
+
+    pub fn serialize<S>(
+        value: &StatisticsFile,
+        serializer: S,
+    ) -> std::result::Result<S::Ok, S::Error>
+    where
+        S: Serializer,
+    {
+        SetStatistics {
+            snapshot_id: Some(value.snapshot_id),
+            statistics: value.clone(),
+        }
+        .serialize(serializer)
+    }
+
+    pub fn deserialize<'de, D>(deserializer: D) -> std::result::Result<StatisticsFile, D::Error>
+    where D: Deserializer<'de> {
+        let SetStatistics {
+            snapshot_id,
+            statistics,
+        } = SetStatistics::deserialize(deserializer)?;
+        if let Some(snapshot_id) = snapshot_id {
+            if snapshot_id != statistics.snapshot_id {
+                return Err(serde::de::Error::custom(format!(
+                    "Snapshot id to set {snapshot_id} does not match the statistics file snapshot id {}",
+                    statistics.snapshot_id
+                )));
+            }
+        }
+
+        Ok(statistics)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
     use std::fmt::Debug;
+    use std::fs::File;
+    use std::io::BufReader;
 
-    use serde::de::DeserializeOwned;
     use serde::Serialize;
+    use serde::de::DeserializeOwned;
     use uuid::uuid;
 
     use super::ViewUpdate;
+    use crate::io::FileIOBuilder;
     use crate::spec::{
-        FormatVersion, NestedField, NullOrder, Operation, PrimitiveType, Schema, Snapshot,
-        SnapshotReference, SnapshotRetention, SortDirection, SortField, SortOrder,
-        SqlViewRepresentation, Summary, TableMetadata, TableMetadataBuilder, Transform, Type,
+        BlobMetadata, FormatVersion, MAIN_BRANCH, NestedField, NullOrder, Operation,
+        PartitionStatisticsFile, PrimitiveType, Schema, Snapshot, SnapshotReference,
+        SnapshotRetention, SortDirection, SortField, SortOrder, SqlViewRepresentation,
+        StatisticsFile, Summary, TableMetadata, TableMetadataBuilder, Transform, Type,
         UnboundPartitionSpec, ViewFormatVersion, ViewRepresentation, ViewRepresentations,
         ViewVersion,
     };
-    use crate::{NamespaceIdent, TableCreation, TableIdent, TableRequirement, TableUpdate};
+    use crate::table::Table;
+    use crate::{
+        NamespaceIdent, TableCommit, TableCreation, TableIdent, TableRequirement, TableUpdate,
+    };
 
     #[test]
     fn test_parent_namespace() {
@@ -768,6 +976,26 @@ mod tests {
         };
 
         assert_eq!(table_id, TableIdent::from_strs(vec!["ns1", "t1"]).unwrap());
+    }
+
+    #[test]
+    fn test_table_creation_iterator_properties() {
+        let builder = TableCreation::builder()
+            .name("table".to_string())
+            .schema(Schema::builder().build().unwrap());
+
+        fn s(k: &str, v: &str) -> (String, String) {
+            (k.to_string(), v.to_string())
+        }
+
+        let table_creation = builder
+            .properties([s("key", "value"), s("foo", "bar")])
+            .build();
+
+        assert_eq!(
+            HashMap::from([s("key", "value"), s("foo", "bar")]),
+            table_creation.properties
+        );
     }
 
     fn test_serde_json<T: Serialize + DeserializeOwned + PartialEq + Debug>(
@@ -799,9 +1027,9 @@ mod tests {
         TableMetadataBuilder::from_table_creation(tbl_creation)
             .unwrap()
             .assign_uuid(uuid::Uuid::nil())
-            .unwrap()
             .build()
             .unwrap()
+            .metadata
     }
 
     #[test]
@@ -851,7 +1079,7 @@ mod tests {
         {
             "snapshot-id": 3051729675574597004,
             "sequence-number": 10,
-            "timestamp-ms": 1515100955770,
+            "timestamp-ms": 9992191116217,
             "summary": {
                 "operation": "append"
             },
@@ -861,10 +1089,30 @@ mod tests {
         "#;
 
         let snapshot = serde_json::from_str::<Snapshot>(record).unwrap();
-        let mut metadata = metadata;
-        metadata.append_snapshot(snapshot);
+        let builder = metadata.into_builder(None);
+        let builder = TableUpdate::AddSnapshot {
+            snapshot: snapshot.clone(),
+        }
+        .apply(builder)
+        .unwrap();
+        let metadata = TableUpdate::SetSnapshotRef {
+            ref_name: MAIN_BRANCH.to_string(),
+            reference: SnapshotReference {
+                snapshot_id: snapshot.snapshot_id(),
+                retention: SnapshotRetention::Branch {
+                    min_snapshots_to_keep: Some(10),
+                    max_snapshot_age_ms: None,
+                    max_ref_age_ms: None,
+                },
+            },
+        }
+        .apply(builder)
+        .unwrap()
+        .build()
+        .unwrap()
+        .metadata;
 
-        // Ref exists and should matches
+        // Ref exists and should match
         let requirement = TableRequirement::RefSnapshotIdMatch {
             r#ref: "main".to_string(),
             snapshot_id: Some(3051729675574597004),
@@ -912,14 +1160,13 @@ mod tests {
     #[test]
     fn test_check_last_assigned_partition_id() {
         let metadata = metadata();
-
         let requirement = TableRequirement::LastAssignedPartitionIdMatch {
-            last_assigned_partition_id: 1,
+            last_assigned_partition_id: 0,
         };
         assert!(requirement.check(Some(&metadata)).is_err());
 
         let requirement = TableRequirement::LastAssignedPartitionIdMatch {
-            last_assigned_partition_id: 0,
+            last_assigned_partition_id: 999,
         };
         assert!(requirement.check(Some(&metadata)).is_ok());
     }
@@ -984,7 +1231,7 @@ mod tests {
 {
     "type": "assert-ref-snapshot-id",
     "ref": "snapshot-name",
-    "snapshot-id": null 
+    "snapshot-id": null
 }
         "#,
             TableRequirement::RefSnapshotIdMatch {
@@ -1104,7 +1351,7 @@ mod tests {
 {
     "action": "assign-uuid",
     "uuid": "2cc52516-5e73-41f2-b139-545d41a4e151"
-}        
+}
         "#,
             TableUpdate::AssignUuid {
                 uuid: uuid!("2cc52516-5e73-41f2-b139-545d41a4e151"),
@@ -1119,7 +1366,7 @@ mod tests {
 {
     "action": "upgrade-format-version",
     "format-version": 2
-}        
+}
         "#,
             TableUpdate::UpgradeFormatVersion {
                 format_version: FormatVersion::V2,
@@ -1175,7 +1422,6 @@ mod tests {
         "#,
             TableUpdate::AddSchema {
                 schema: test_schema.clone(),
-                last_column_id: Some(3),
             },
         );
 
@@ -1214,7 +1460,6 @@ mod tests {
         "#,
             TableUpdate::AddSchema {
                 schema: test_schema.clone(),
-                last_column_id: None,
             },
         );
     }
@@ -1430,7 +1675,7 @@ mod tests {
         1,
         2
     ]
-}  
+}
         "#;
 
         let update = TableUpdate::RemoveSnapshots {
@@ -1490,7 +1735,7 @@ mod tests {
     "min-snapshots-to-keep": 2,
     "max-snapshot-age-ms": 3,
     "max-ref-age-ms": 4
-}        
+}
         "#;
 
         let update = TableUpdate::SetSnapshotRef {
@@ -1517,7 +1762,7 @@ mod tests {
         "prop1": "v1",
         "prop2": "v2"
     }
-}        
+}
         "#;
 
         let update = TableUpdate::SetProperties {
@@ -1541,7 +1786,7 @@ mod tests {
         "prop1",
         "prop2"
     ]
-}        
+}
         "#;
 
         let update = TableUpdate::RemoveProperties {
@@ -1578,8 +1823,12 @@ mod tests {
         let table_metadata = TableMetadataBuilder::from_table_creation(table_creation)
             .unwrap()
             .build()
-            .unwrap();
-        let table_metadata_builder = TableMetadataBuilder::new(table_metadata);
+            .unwrap()
+            .metadata;
+        let table_metadata_builder = TableMetadataBuilder::new_from_metadata(
+            table_metadata,
+            Some("s3://db/table/metadata/metadata1.gz.json".to_string()),
+        );
 
         let uuid = uuid::Uuid::new_v4();
         let update = TableUpdate::AssignUuid { uuid };
@@ -1587,7 +1836,8 @@ mod tests {
             .apply(table_metadata_builder)
             .unwrap()
             .build()
-            .unwrap();
+            .unwrap()
+            .metadata;
         assert_eq!(updated_metadata.uuid(), uuid);
     }
 
@@ -1598,7 +1848,7 @@ mod tests {
 {
     "action": "assign-uuid",
     "uuid": "2cc52516-5e73-41f2-b139-545d41a4e151"
-}        
+}
         "#,
             ViewUpdate::AssignUuid {
                 uuid: uuid!("2cc52516-5e73-41f2-b139-545d41a4e151"),
@@ -1613,7 +1863,7 @@ mod tests {
 {
     "action": "upgrade-format-version",
     "format-version": 1
-}        
+}
         "#,
             ViewUpdate::UpgradeFormatVersion {
                 format_version: ViewFormatVersion::V1,
@@ -1681,7 +1931,7 @@ mod tests {
 {
     "action": "set-location",
     "location": "s3://db/view"
-}        
+}
         "#,
             ViewUpdate::SetLocation {
                 location: "s3://db/view".to_string(),
@@ -1699,7 +1949,7 @@ mod tests {
         "prop1": "v1",
         "prop2": "v2"
     }
-}        
+}
         "#,
             ViewUpdate::SetProperties {
                 updates: vec![
@@ -1722,7 +1972,7 @@ mod tests {
         "prop1",
         "prop2"
     ]
-}        
+}
         "#,
             ViewUpdate::RemoveProperties {
                 removals: vec!["prop1".to_string(), "prop2".to_string()],
@@ -1751,7 +2001,7 @@ mod tests {
               "dialect" : "spark"
             } ]
     }
-}        
+}
         "#,
             ViewUpdate::AddViewVersion {
                 view_version: ViewVersion::builder()
@@ -1781,9 +2031,211 @@ mod tests {
 {
     "action": "set-current-view-version",
     "view-version-id": 1
-}        
+}
         "#,
             ViewUpdate::SetCurrentViewVersion { view_version_id: 1 },
+        );
+    }
+
+    #[test]
+    fn test_remove_partition_specs_update() {
+        test_serde_json(
+            r#"
+{
+    "action": "remove-partition-specs",
+    "spec-ids": [1, 2]
+}
+        "#,
+            TableUpdate::RemovePartitionSpecs {
+                spec_ids: vec![1, 2],
+            },
+        );
+    }
+
+    #[test]
+    fn test_set_statistics_file() {
+        test_serde_json(
+            r#"
+        {
+                "action": "set-statistics",
+                "snapshot-id": 1940541653261589030,
+                "statistics": {
+                        "snapshot-id": 1940541653261589030,
+                        "statistics-path": "s3://bucket/warehouse/stats.puffin",
+                        "file-size-in-bytes": 124,
+                        "file-footer-size-in-bytes": 27,
+                        "blob-metadata": [
+                                {
+                                        "type": "boring-type",
+                                        "snapshot-id": 1940541653261589030,
+                                        "sequence-number": 2,
+                                        "fields": [
+                                                1
+                                        ],
+                                        "properties": {
+                                                "prop-key": "prop-value"
+                                        }
+                                }
+                        ]
+                }
+        }
+        "#,
+            TableUpdate::SetStatistics {
+                statistics: StatisticsFile {
+                    snapshot_id: 1940541653261589030,
+                    statistics_path: "s3://bucket/warehouse/stats.puffin".to_string(),
+                    file_size_in_bytes: 124,
+                    file_footer_size_in_bytes: 27,
+                    key_metadata: None,
+                    blob_metadata: vec![BlobMetadata {
+                        r#type: "boring-type".to_string(),
+                        snapshot_id: 1940541653261589030,
+                        sequence_number: 2,
+                        fields: vec![1],
+                        properties: vec![("prop-key".to_string(), "prop-value".to_string())]
+                            .into_iter()
+                            .collect(),
+                    }],
+                },
+            },
+        );
+    }
+
+    #[test]
+    fn test_remove_statistics_file() {
+        test_serde_json(
+            r#"
+        {
+                "action": "remove-statistics",
+                "snapshot-id": 1940541653261589030
+        }
+        "#,
+            TableUpdate::RemoveStatistics {
+                snapshot_id: 1940541653261589030,
+            },
+        );
+    }
+
+    #[test]
+    fn test_set_partition_statistics_file() {
+        test_serde_json(
+            r#"
+            {
+                "action": "set-partition-statistics",
+                "partition-statistics": {
+                    "snapshot-id": 1940541653261589030,
+                    "statistics-path": "s3://bucket/warehouse/stats1.parquet",
+                    "file-size-in-bytes": 43
+                }
+            }
+            "#,
+            TableUpdate::SetPartitionStatistics {
+                partition_statistics: PartitionStatisticsFile {
+                    snapshot_id: 1940541653261589030,
+                    statistics_path: "s3://bucket/warehouse/stats1.parquet".to_string(),
+                    file_size_in_bytes: 43,
+                },
+            },
+        )
+    }
+
+    #[test]
+    fn test_remove_partition_statistics_file() {
+        test_serde_json(
+            r#"
+            {
+                "action": "remove-partition-statistics",
+                "snapshot-id": 1940541653261589030
+            }
+            "#,
+            TableUpdate::RemovePartitionStatistics {
+                snapshot_id: 1940541653261589030,
+            },
+        )
+    }
+
+    #[test]
+    fn test_remove_schema_update() {
+        test_serde_json(
+            r#"
+                {
+                    "action": "remove-schemas",
+                    "schema-ids": [1, 2]
+                }        
+            "#,
+            TableUpdate::RemoveSchemas {
+                schema_ids: vec![1, 2],
+            },
+        );
+    }
+
+    #[test]
+    fn test_table_commit() {
+        let table = {
+            let file = File::open(format!(
+                "{}/testdata/table_metadata/{}",
+                env!("CARGO_MANIFEST_DIR"),
+                "TableMetadataV2Valid.json"
+            ))
+            .unwrap();
+            let reader = BufReader::new(file);
+            let resp = serde_json::from_reader::<_, TableMetadata>(reader).unwrap();
+
+            Table::builder()
+                .metadata(resp)
+                .metadata_location("s3://bucket/test/location/metadata/00000-8a62c37d-4573-4021-952a-c0baef7d21d0.metadata.json".to_string())
+                .identifier(TableIdent::from_strs(["ns1", "test1"]).unwrap())
+                .file_io(FileIOBuilder::new("memory").build().unwrap())
+                .build()
+                .unwrap()
+        };
+
+        let updates = vec![
+            TableUpdate::SetLocation {
+                location: "s3://bucket/test/new_location/data".to_string(),
+            },
+            TableUpdate::SetProperties {
+                updates: vec![
+                    ("prop1".to_string(), "v1".to_string()),
+                    ("prop2".to_string(), "v2".to_string()),
+                ]
+                .into_iter()
+                .collect(),
+            },
+        ];
+
+        let requirements = vec![TableRequirement::UuidMatch {
+            uuid: table.metadata().table_uuid,
+        }];
+
+        let table_commit = TableCommit::builder()
+            .ident(table.identifier().to_owned())
+            .updates(updates)
+            .requirements(requirements)
+            .build();
+
+        let updated_table = table_commit.apply(table).unwrap();
+
+        assert_eq!(
+            updated_table.metadata().properties.get("prop1").unwrap(),
+            "v1"
+        );
+        assert_eq!(
+            updated_table.metadata().properties.get("prop2").unwrap(),
+            "v2"
+        );
+
+        // metadata version should be bumped
+        assert!(
+            updated_table
+                .metadata_location()
+                .unwrap()
+                .starts_with("s3://bucket/test/location/metadata/00001-")
+        );
+
+        assert_eq!(
+            updated_table.metadata().location,
+            "s3://bucket/test/new_location/data",
         );
     }
 }

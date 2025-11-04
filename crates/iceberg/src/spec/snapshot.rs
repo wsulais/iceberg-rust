@@ -27,13 +27,15 @@ use serde::{Deserialize, Serialize};
 use typed_builder::TypedBuilder;
 
 use super::table_metadata::SnapshotLog;
-use crate::error::{timestamp_ms_to_utc, Result};
+use crate::error::{Result, timestamp_ms_to_utc};
 use crate::io::FileIO;
-use crate::spec::{ManifestList, SchemaId, SchemaRef, StructType, TableMetadata};
+use crate::spec::{ManifestList, SchemaId, SchemaRef, TableMetadata};
 use crate::{Error, ErrorKind};
 
 /// The ref name of the main branch of the table.
 pub const MAIN_BRANCH: &str = "main";
+/// Placeholder for snapshot ID. The field with this value must be replaced with the actual snapshot ID before it is committed.
+pub const UNASSIGNED_SNAPSHOT_ID: i64 = -1;
 
 /// Reference to [`Snapshot`].
 pub type SnapshotRef = Arc<Snapshot>;
@@ -50,6 +52,18 @@ pub enum Operation {
     Overwrite,
     /// Data files were removed and their contents logically deleted and/or delete files were added to delete rows.
     Delete,
+}
+
+impl Operation {
+    /// Returns the string representation (lowercase) of the operation.
+    pub fn as_str(&self) -> &str {
+        match self {
+            Operation::Append => "append",
+            Operation::Replace => "replace",
+            Operation::Overwrite => "overwrite",
+            Operation::Delete => "delete",
+        }
+    }
 }
 
 #[derive(Debug, Serialize, Deserialize, PartialEq, Eq, Clone)]
@@ -93,7 +107,7 @@ pub struct Snapshot {
     /// A string map that summarizes the snapshot changes, including operation.
     summary: Summary,
     /// ID of the table’s current schema when the snapshot was created.
-    #[builder(setter(strip_option), default = None)]
+    #[builder(setter(strip_option(fallback = schema_id_opt)), default = None)]
     schema_id: Option<SchemaId>,
 }
 
@@ -152,7 +166,7 @@ impl Snapshot {
                 .ok_or_else(|| {
                     Error::new(
                         ErrorKind::DataInvalid,
-                        format!("Schema with id {} not found", schema_id),
+                        format!("Schema with id {schema_id} not found"),
                     )
                 })?
                 .clone(),
@@ -176,23 +190,15 @@ impl Snapshot {
         table_metadata: &TableMetadata,
     ) -> Result<ManifestList> {
         let manifest_list_content = file_io.new_input(&self.manifest_list)?.read().await?;
-
-        let schema = self.schema(table_metadata)?;
-
-        let partition_type_provider = |partition_spec_id: i32| -> Result<Option<StructType>> {
-            table_metadata
-                .partition_spec_by_id(partition_spec_id)
-                .map(|partition_spec| partition_spec.partition_type(&schema))
-                .transpose()
-        };
-
         ManifestList::parse_with_version(
             &manifest_list_content,
+            // TODO: You don't really need the version since you could just project any Avro in
+            // the version that you'd like to get (probably always the latest)
             table_metadata.format_version(),
-            partition_type_provider,
         )
     }
 
+    #[allow(dead_code)]
     pub(crate) fn log(&self) -> SnapshotLog {
         SnapshotLog {
             timestamp_ms: self.timestamp_ms,
@@ -211,8 +217,8 @@ pub(super) mod _serde {
     use serde::{Deserialize, Serialize};
 
     use super::{Operation, Snapshot, Summary};
-    use crate::spec::SchemaId;
     use crate::Error;
+    use crate::spec::SchemaId;
 
     #[derive(Debug, Serialize, Deserialize, PartialEq, Eq)]
     #[serde(rename_all = "kebab-case")]
@@ -325,6 +331,13 @@ pub struct SnapshotReference {
 }
 
 impl SnapshotReference {
+    /// Returns true if the snapshot reference is a branch.
+    pub fn is_branch(&self) -> bool {
+        matches!(self.retention, SnapshotRetention::Branch { .. })
+    }
+}
+
+impl SnapshotReference {
     /// Create new snapshot reference
     pub fn new(snapshot_id: i64, retention: SnapshotRetention) -> Self {
         SnapshotReference {
@@ -421,5 +434,95 @@ mod tests {
             *result.summary()
         );
         assert_eq!("s3://b/wh/.../s1.avro".to_string(), *result.manifest_list());
+    }
+
+    #[test]
+    fn test_snapshot_v1_to_v2_projection() {
+        use crate::spec::snapshot::_serde::SnapshotV1;
+
+        // Create a V1 snapshot (without sequence-number field)
+        let v1_snapshot = SnapshotV1 {
+            snapshot_id: 1234567890,
+            parent_snapshot_id: Some(987654321),
+            timestamp_ms: 1515100955770,
+            manifest_list: Some("s3://bucket/manifest-list.avro".to_string()),
+            manifests: None, // V1 can have either manifest_list or manifests, but not both
+            summary: Some(Summary {
+                operation: Operation::Append,
+                additional_properties: HashMap::from([
+                    ("added-files".to_string(), "5".to_string()),
+                    ("added-records".to_string(), "100".to_string()),
+                ]),
+            }),
+            schema_id: Some(1),
+        };
+
+        // Convert V1 to V2 - this should apply defaults for missing V2 fields
+        let v2_snapshot: Snapshot = v1_snapshot.try_into().unwrap();
+
+        // Verify V1→V2 projection defaults are applied correctly
+        assert_eq!(
+            v2_snapshot.sequence_number(),
+            0,
+            "V1 snapshot sequence_number should default to 0"
+        );
+
+        // Verify other fields are preserved correctly during conversion
+        assert_eq!(v2_snapshot.snapshot_id(), 1234567890);
+        assert_eq!(v2_snapshot.parent_snapshot_id(), Some(987654321));
+        assert_eq!(v2_snapshot.timestamp_ms(), 1515100955770);
+        assert_eq!(
+            v2_snapshot.manifest_list(),
+            "s3://bucket/manifest-list.avro"
+        );
+        assert_eq!(v2_snapshot.schema_id(), Some(1));
+        assert_eq!(v2_snapshot.summary().operation, Operation::Append);
+        assert_eq!(
+            v2_snapshot
+                .summary()
+                .additional_properties
+                .get("added-files"),
+            Some(&"5".to_string())
+        );
+    }
+
+    #[test]
+    fn test_snapshot_v1_to_v2_with_missing_summary() {
+        use crate::spec::snapshot::_serde::SnapshotV1;
+
+        // Create a V1 snapshot without summary (should get default)
+        let v1_snapshot = SnapshotV1 {
+            snapshot_id: 1111111111,
+            parent_snapshot_id: None,
+            timestamp_ms: 1515100955770,
+            manifest_list: Some("s3://bucket/manifest-list.avro".to_string()),
+            manifests: None,
+            summary: None, // V1 summary is optional
+            schema_id: None,
+        };
+
+        // Convert V1 to V2 - this should apply default summary
+        let v2_snapshot: Snapshot = v1_snapshot.try_into().unwrap();
+
+        // Verify defaults are applied correctly
+        assert_eq!(
+            v2_snapshot.sequence_number(),
+            0,
+            "V1 snapshot sequence_number should default to 0"
+        );
+        assert_eq!(
+            v2_snapshot.summary().operation,
+            Operation::Append,
+            "Missing V1 summary should default to Append operation"
+        );
+        assert!(
+            v2_snapshot.summary().additional_properties.is_empty(),
+            "Default summary should have empty additional_properties"
+        );
+
+        // Verify other fields
+        assert_eq!(v2_snapshot.snapshot_id(), 1111111111);
+        assert_eq!(v2_snapshot.parent_snapshot_id(), None);
+        assert_eq!(v2_snapshot.schema_id(), None);
     }
 }

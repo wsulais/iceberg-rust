@@ -18,6 +18,8 @@
 use std::net::IpAddr;
 use std::process::Command;
 
+use tracing::error;
+
 use crate::cmd::{get_cmd_output, get_cmd_output_result, run_command};
 
 /// A utility to manage the lifecycle of `docker compose`.
@@ -65,7 +67,7 @@ impl DockerCompose {
         }
     }
 
-    pub fn run(&self) {
+    pub fn up(&self) {
         let mut cmd = Command::new("docker");
         cmd.current_dir(&self.docker_compose_dir);
 
@@ -82,13 +84,56 @@ impl DockerCompose {
             "1200000",
         ]);
 
-        run_command(
+        let ret = run_command(
             cmd,
             format!(
                 "Starting docker compose in {}, project name: {}",
                 self.docker_compose_dir, self.project_name
             ),
-        )
+        );
+
+        if !ret {
+            let mut cmd = Command::new("docker");
+            cmd.current_dir(&self.docker_compose_dir);
+
+            cmd.env("DOCKER_DEFAULT_PLATFORM", Self::get_os_arch());
+
+            cmd.args(vec![
+                "compose",
+                "-p",
+                self.project_name.as_str(),
+                "logs",
+                "spark-iceberg",
+            ]);
+            run_command(cmd, "Docker compose logs");
+            panic!("Docker compose up failed!")
+        }
+    }
+
+    pub fn down(&self) {
+        let mut cmd = Command::new("docker");
+        cmd.current_dir(&self.docker_compose_dir);
+
+        cmd.args(vec![
+            "compose",
+            "-p",
+            self.project_name.as_str(),
+            "down",
+            "-v",
+            "--remove-orphans",
+        ]);
+
+        let ret = run_command(
+            cmd,
+            format!(
+                "Stopping docker compose in {}, project name: {}",
+                self.docker_compose_dir, self.project_name
+            ),
+        );
+
+        if !ret {
+            panic!("Failed to stop docker compose")
+        }
     }
 
     pub fn get_container_ip(&self, service_name: impl AsRef<str>) -> IpAddr {
@@ -105,7 +150,7 @@ impl DockerCompose {
         match ip_result {
             Ok(ip) => ip,
             Err(e) => {
-                log::error!("Invalid IP, {e}");
+                error!("Invalid IP, {e}");
                 panic!("Failed to parse IP for {container_name}")
             }
         }
@@ -114,24 +159,6 @@ impl DockerCompose {
 
 impl Drop for DockerCompose {
     fn drop(&mut self) {
-        let mut cmd = Command::new("docker");
-        cmd.current_dir(&self.docker_compose_dir);
-
-        cmd.args(vec![
-            "compose",
-            "-p",
-            self.project_name.as_str(),
-            "down",
-            "-v",
-            "--remove-orphans",
-        ]);
-
-        run_command(
-            cmd,
-            format!(
-                "Stopping docker compose in {}, project name: {}",
-                self.docker_compose_dir, self.project_name
-            ),
-        )
+        self.down()
     }
 }

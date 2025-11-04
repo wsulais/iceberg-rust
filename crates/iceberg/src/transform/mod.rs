@@ -17,6 +17,8 @@
 
 //! Transform function used to compute partition values.
 
+use std::fmt::Debug;
+
 use arrow_array::ArrayRef;
 
 use crate::spec::{Datum, Transform};
@@ -29,7 +31,7 @@ mod truncate;
 mod void;
 
 /// TransformFunction is a trait that defines the interface for all transform functions.
-pub trait TransformFunction: Send + Sync {
+pub trait TransformFunction: Send + Sync + Debug {
     /// transform will take an input array and transform it into a new array.
     /// The implementation of this function will need to check and downcast the input to specific
     /// type.
@@ -42,7 +44,7 @@ pub trait TransformFunction: Send + Sync {
         self.transform_literal(input)?.ok_or_else(|| {
             Error::new(
                 ErrorKind::Unexpected,
-                format!("Returns 'None' for literal {}", input),
+                format!("Returns 'None' for literal {input}"),
             )
         })
     }
@@ -74,12 +76,12 @@ mod test {
     use std::collections::HashSet;
     use std::sync::Arc;
 
+    use crate::Result;
     use crate::expr::accessor::StructAccessor;
     use crate::expr::{
         BinaryExpression, BoundPredicate, BoundReference, PredicateOperator, SetExpression,
     };
     use crate::spec::{Datum, NestedField, NestedFieldRef, PrimitiveType, Transform, Type};
-    use crate::Result;
 
     /// A utitily struct, test fixture
     /// used for testing the projection on `Transform`
@@ -157,6 +159,7 @@ mod test {
     }
 
     impl TestTransformFixture {
+        #[track_caller]
         pub(crate) fn assert_transform(&self, trans: Transform) {
             assert_eq!(self.display, format!("{trans}"));
             assert_eq!(self.json, serde_json::to_string(&trans).unwrap());
@@ -168,15 +171,16 @@ mod test {
                 assert_eq!(
                     satisfies_order_of,
                     &trans.satisfies_order_of(other_trans),
-                    "Failed to check satisfies order {}, {}, {}",
-                    trans,
-                    other_trans,
-                    satisfies_order_of
+                    "Failed to check satisfies order {trans}, {other_trans}, {satisfies_order_of}"
                 );
             }
 
-            for (input_type, result_type) in &self.trans_types {
-                assert_eq!(result_type, &trans.result_type(input_type).ok());
+            for (i, (input_type, result_type)) in self.trans_types.iter().enumerate() {
+                let actual = trans.result_type(input_type).ok();
+                assert_eq!(
+                    result_type, &actual,
+                    "type mismatch at index {i}, input: {input_type}, expected: {result_type:?}, actual: {actual:?}"
+                );
             }
         }
     }

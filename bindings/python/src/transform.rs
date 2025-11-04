@@ -15,7 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
-use arrow::array::{make_array, Array, ArrayData};
+use arrow::array::{Array, ArrayData, make_array};
 use arrow::pyarrow::{FromPyArrow, ToPyArrow};
 use iceberg::spec::Transform;
 use iceberg::transform::create_transform_function;
@@ -75,7 +75,7 @@ fn apply(py: Python, array: PyObject, transform: Transform) -> PyResult<PyObject
 }
 
 pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> {
-    let this = PyModule::new_bound(py, "transform")?;
+    let this = PyModule::new(py, "transform")?;
 
     this.add_function(wrap_pyfunction!(identity, &this)?)?;
     this.add_function(wrap_pyfunction!(void, &this)?)?;
@@ -87,7 +87,7 @@ pub fn register_module(py: Python<'_>, m: &Bound<'_, PyModule>) -> PyResult<()> 
     this.add_function(wrap_pyfunction!(truncate, &this)?)?;
 
     m.add_submodule(&this)?;
-    py.import_bound("sys")?
+    py.import("sys")?
         .getattr("modules")?
         .set_item("pyiceberg_core.transform", this)
 }

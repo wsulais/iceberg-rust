@@ -151,7 +151,10 @@ fn check_cmd(cmd: &CreateExternalTable) -> Result<()> {
         || !column_defaults.is_empty();
 
     if is_invalid {
-        return Err(Error::new(ErrorKind::FeatureUnsupported, "Currently we only support reading existing icebergs tables in external table command. To create new table, please use catalog provider."));
+        return Err(Error::new(
+            ErrorKind::FeatureUnsupported,
+            "Currently we only support reading existing icebergs tables in external table command. To create new table, please use catalog provider.",
+        ));
     }
 
     Ok(())
@@ -238,7 +241,7 @@ mod tests {
             options: Default::default(),
             table_partition_cols: Default::default(),
             order_exprs: Default::default(),
-            constraints: Constraints::empty(),
+            constraints: Constraints::default(),
             column_defaults: Default::default(),
             if_not_exists: Default::default(),
             temporary: false,

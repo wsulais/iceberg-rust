@@ -17,25 +17,29 @@
 
 use std::process::Command;
 
-pub fn run_command(mut cmd: Command, desc: impl ToString) {
+use tracing::{error, info};
+
+pub fn run_command(mut cmd: Command, desc: impl ToString) -> bool {
     let desc = desc.to_string();
-    log::info!("Starting to {}, command: {:?}", &desc, cmd);
+    info!("Starting to {}, command: {:?}", &desc, cmd);
     let exit = cmd.status().unwrap();
     if exit.success() {
-        log::info!("{} succeed!", desc)
+        info!("{} succeed!", desc);
+        true
     } else {
-        panic!("{} failed: {:?}", desc, exit);
+        error!("{} failed: {:?}", desc, exit);
+        false
     }
 }
 
 pub fn get_cmd_output_result(mut cmd: Command, desc: impl ToString) -> Result<String, String> {
     let desc = desc.to_string();
-    log::info!("Starting to {}, command: {:?}", &desc, cmd);
+    info!("Starting to {}, command: {:?}", &desc, cmd);
     let result = cmd.output();
     match result {
         Ok(output) => {
             if output.status.success() {
-                log::info!("{} succeed!", desc);
+                info!("{} succeed!", desc);
                 Ok(String::from_utf8(output.stdout).unwrap())
             } else {
                 Err(format!("{} failed with rc: {:?}", desc, output.status))

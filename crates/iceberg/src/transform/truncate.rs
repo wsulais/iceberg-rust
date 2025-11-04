@@ -21,8 +21,8 @@ use arrow_array::ArrayRef;
 use arrow_schema::DataType;
 
 use super::TransformFunction;
-use crate::spec::{Datum, PrimitiveLiteral};
 use crate::Error;
+use crate::spec::{Datum, PrimitiveLiteral};
 
 #[derive(Debug)]
 pub struct Truncate {
@@ -40,6 +40,11 @@ impl Truncate {
             None => s,
             Some((idx, _)) => &s[..idx],
         }
+    }
+
+    #[inline]
+    fn truncate_binary(s: &[u8], width: usize) -> &[u8] {
+        if s.len() > width { &s[0..width] } else { s }
     }
 
     #[inline]
@@ -119,6 +124,18 @@ impl TransformFunction for Truncate {
                 );
                 Ok(Arc::new(res))
             }
+            DataType::Binary => {
+                let len = self.width as usize;
+                let res: arrow_array::BinaryArray = arrow_array::BinaryArray::from_iter(
+                    input
+                        .as_any()
+                        .downcast_ref::<arrow_array::BinaryArray>()
+                        .unwrap()
+                        .iter()
+                        .map(|v| v.map(|v| Self::truncate_binary(v, len))),
+                );
+                Ok(Arc::new(res))
+            }
             _ => Err(crate::Error::new(
                 crate::ErrorKind::FeatureUnsupported,
                 format!(
@@ -171,6 +188,7 @@ mod test {
     use arrow_array::types::Decimal128Type;
     use arrow_array::{Decimal128Array, Int32Array, Int64Array};
 
+    use crate::Result;
     use crate::expr::PredicateOperator;
     use crate::spec::PrimitiveType::{
         Binary, Date, Decimal, Fixed, Int, Long, String as StringType, Time, Timestamp,
@@ -178,9 +196,8 @@ mod test {
     };
     use crate::spec::Type::{Primitive, Struct};
     use crate::spec::{Datum, NestedField, PrimitiveType, StructType, Transform, Type};
-    use crate::transform::test::{TestProjectionFixture, TestTransformFixture};
     use crate::transform::TransformFunction;
-    use crate::Result;
+    use crate::transform::test::{TestProjectionFixture, TestTransformFixture};
 
     #[test]
     fn test_truncate_transform() {
@@ -222,12 +239,9 @@ mod test {
                 (Primitive(TimestampNs), None),
                 (Primitive(TimestamptzNs), None),
                 (
-                    Struct(StructType::new(vec![NestedField::optional(
-                        1,
-                        "a",
-                        Primitive(Timestamp),
-                    )
-                    .into()])),
+                    Struct(StructType::new(vec![
+                        NestedField::optional(1, "a", Primitive(Timestamp)).into(),
+                    ])),
                     None,
                 ),
             ],
@@ -308,7 +322,7 @@ mod test {
         fixture.assert_projection(
             &fixture.set_predicate(PredicateOperator::In, vec![
                 Datum::string(value),
-                Datum::string(format!("{}abc", value)),
+                Datum::string(format!("{value}abc")),
             ]),
             Some(r#"name IN ("abcde")"#),
         )?;
@@ -316,7 +330,7 @@ mod test {
         fixture.assert_projection(
             &fixture.set_predicate(PredicateOperator::NotIn, vec![
                 Datum::string(value),
-                Datum::string(format!("{}abc", value)),
+                Datum::string(format!("{value}abc")),
             ]),
             None,
         )?;
@@ -712,11 +726,11 @@ mod test {
         );
 
         // test decimal
-        let mut buidler = PrimitiveBuilder::<Decimal128Type>::new()
+        let mut builder = PrimitiveBuilder::<Decimal128Type>::new()
             .with_precision_and_scale(20, 2)
             .unwrap();
-        buidler.append_value(1065);
-        let input = Arc::new(buidler.finish());
+        builder.append_value(1065);
+        let input = Arc::new(builder.finish());
         let res = super::Truncate::new(50).transform(input).unwrap();
         assert_eq!(
             res.as_any()
@@ -746,6 +760,17 @@ mod test {
                 .unwrap()
                 .value(0),
             "ice"
+        );
+
+        // test binary
+        let input = Arc::new(arrow_array::BinaryArray::from_vec(vec![b"iceberg"]));
+        let res = super::Truncate::new(3).transform(input).unwrap();
+        assert_eq!(
+            res.as_any()
+                .downcast_ref::<arrow_array::BinaryArray>()
+                .unwrap()
+                .value(0),
+            b"ice"
         );
     }
 

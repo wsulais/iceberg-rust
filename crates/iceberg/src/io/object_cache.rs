@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::mem::size_of_val;
 use std::sync::Arc;
 
 use crate::io::FileIO;
@@ -112,7 +113,7 @@ impl ObjectCache {
             CachedItem::Manifest(arc_manifest) => Ok(arc_manifest),
             _ => Err(Error::new(
                 ErrorKind::Unexpected,
-                format!("cached object for key '{:?}' is not a Manifest", key),
+                format!("cached object for key '{key:?}' is not a Manifest"),
             )),
         }
     }
@@ -141,14 +142,22 @@ impl ObjectCache {
             .entry_by_ref(&key)
             .or_try_insert_with(self.fetch_and_parse_manifest_list(snapshot, table_metadata))
             .await
-            .map_err(|err| Error::new(ErrorKind::Unexpected, err.as_ref().message()))?
+            .map_err(|err| {
+                Arc::try_unwrap(err).unwrap_or_else(|err| {
+                    Error::new(
+                        ErrorKind::Unexpected,
+                        "Failed to load manifest list in cache",
+                    )
+                    .with_source(err)
+                })
+            })?
             .into_value();
 
         match cache_entry {
             CachedItem::ManifestList(arc_manifest_list) => Ok(arc_manifest_list),
             _ => Err(Error::new(
                 ErrorKind::Unexpected,
-                format!("cached object for path '{:?}' is not a manifest list", key),
+                format!("cached object for path '{key:?}' is not a manifest list"),
             )),
         }
     }
@@ -176,19 +185,26 @@ impl ObjectCache {
 mod tests {
     use std::fs;
 
+    use minijinja::value::Value;
+    use minijinja::{AutoEscape, Environment, context};
     use tempfile::TempDir;
-    use tera::{Context, Tera};
     use uuid::Uuid;
 
     use super::*;
+    use crate::TableIdent;
     use crate::io::{FileIO, OutputFile};
     use crate::spec::{
         DataContentType, DataFileBuilder, DataFileFormat, FormatVersion, Literal, Manifest,
         ManifestContentType, ManifestEntry, ManifestListWriter, ManifestMetadata, ManifestStatus,
-        ManifestWriter, Struct, TableMetadata,
+        ManifestWriter, ManifestWriterBuilder, Struct, TableMetadata,
     };
     use crate::table::Table;
-    use crate::TableIdent;
+
+    fn render_template(template: &str, ctx: Value) -> String {
+        let mut env = Environment::new();
+        env.set_auto_escape_callback(|_| AutoEscape::None);
+        env.render_str(template, ctx).unwrap()
+    }
 
     struct TableTestFixture {
         table_location: String,
@@ -214,13 +230,15 @@ mod tests {
                     env!("CARGO_MANIFEST_DIR")
                 ))
                 .unwrap();
-                let mut context = Context::new();
-                context.insert("table_location", &table_location);
-                context.insert("manifest_list_1_location", &manifest_list1_location);
-                context.insert("manifest_list_2_location", &manifest_list2_location);
-                context.insert("table_metadata_1_location", &table_metadata1_location);
-
-                let metadata_json = Tera::one_off(&template_json_str, &context, false).unwrap();
+                let metadata_json = render_template(
+                    &template_json_str,
+                    context! {
+                        table_location => &table_location,
+                        manifest_list_1_location => &manifest_list1_location,
+                        manifest_list_2_location => &manifest_list2_location,
+                        table_metadata_1_location => &table_metadata1_location,
+                    },
+                );
                 serde_json::from_str::<TableMetadata>(&metadata_json).unwrap()
             };
 
@@ -255,36 +273,34 @@ mod tests {
             let current_partition_spec = self.table.metadata().default_partition_spec();
 
             // Write data files
-            let data_file_manifest = ManifestWriter::new(
+            let mut writer = ManifestWriterBuilder::new(
                 self.next_manifest_file(),
-                current_snapshot.snapshot_id(),
-                vec![],
+                Some(current_snapshot.snapshot_id()),
+                None,
+                current_schema.clone(),
+                current_partition_spec.as_ref().clone(),
             )
-            .write(Manifest::new(
-                ManifestMetadata::builder()
-                    .schema(current_schema.clone())
-                    .content(ManifestContentType::Data)
-                    .format_version(FormatVersion::V2)
-                    .partition_spec((**current_partition_spec).clone())
-                    .schema_id(current_schema.schema_id())
-                    .build(),
-                vec![ManifestEntry::builder()
-                    .status(ManifestStatus::Added)
-                    .data_file(
-                        DataFileBuilder::default()
-                            .content(DataContentType::Data)
-                            .file_path(format!("{}/1.parquet", &self.table_location))
-                            .file_format(DataFileFormat::Parquet)
-                            .file_size_in_bytes(100)
-                            .record_count(1)
-                            .partition(Struct::from_iter([Some(Literal::long(100))]))
-                            .build()
-                            .unwrap(),
-                    )
-                    .build()],
-            ))
-            .await
-            .unwrap();
+            .build_v2_data();
+            writer
+                .add_entry(
+                    ManifestEntry::builder()
+                        .status(ManifestStatus::Added)
+                        .data_file(
+                            DataFileBuilder::default()
+                                .partition_spec_id(0)
+                                .content(DataContentType::Data)
+                                .file_path(format!("{}/1.parquet", &self.table_location))
+                                .file_format(DataFileFormat::Parquet)
+                                .file_size_in_bytes(100)
+                                .record_count(1)
+                                .partition(Struct::from_iter([Some(Literal::long(100))]))
+                                .build()
+                                .unwrap(),
+                        )
+                        .build(),
+                )
+                .unwrap();
+            let data_file_manifest = writer.write_manifest_file().await.unwrap();
 
             // Write to manifest list
             let mut manifest_list_write = ManifestListWriter::v2(

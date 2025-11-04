@@ -15,6 +15,7 @@
 // specific language governing permissions and limitations
 // under the License.
 
+use std::any::{Any, TypeId};
 use std::collections::HashMap;
 use std::ops::Range;
 use std::sync::Arc;
@@ -35,18 +36,30 @@ use crate::{Error, ErrorKind, Result};
 ///
 /// Supported storages:
 ///
-/// | Storage            | Feature Flag     | Schemes    |
-/// |--------------------|-------------------|------------|
-/// | Local file system  | `storage-fs`      | `file`     |
-/// | Memory             | `storage-memory`  | `memory`   |
-/// | S3                 | `storage-s3`      | `s3`, `s3a`|
-/// | GCS                | `storage-gcs`     | `gcs`       |
+/// | Storage            | Feature Flag      | Expected Path Format             | Schemes                       |
+/// |--------------------|-------------------|----------------------------------| ------------------------------|
+/// | Local file system  | `storage-fs`      | `file`                           | `file://path/to/file`         |
+/// | Memory             | `storage-memory`  | `memory`                         | `memory://path/to/file`       |
+/// | S3                 | `storage-s3`      | `s3`, `s3a`                      | `s3://<bucket>/path/to/file`  |
+/// | GCS                | `storage-gcs`     | `gs`, `gcs`                      | `gs://<bucket>/path/to/file`  |
+/// | OSS                | `storage-oss`     | `oss`                            | `oss://<bucket>/path/to/file` |
+/// | Azure Datalake     | `storage-azdls`   | `abfs`, `abfss`, `wasb`, `wasbs` | `abfs://<filesystem>@<account>.dfs.core.windows.net/path/to/file` or `wasb://<container>@<account>.blob.core.windows.net/path/to/file` |
 #[derive(Clone, Debug)]
 pub struct FileIO {
+    builder: FileIOBuilder,
+
     inner: Arc<Storage>,
 }
 
 impl FileIO {
+    /// Convert FileIO into [`FileIOBuilder`] which used to build this FileIO.
+    ///
+    /// This function is useful when you want serialize and deserialize FileIO across
+    /// distributed systems.
+    pub fn into_builder(self) -> FileIOBuilder {
+        self.builder
+    }
+
     /// Try to infer file io scheme from path. See [`FileIO`] for supported schemes.
     ///
     /// - If it's a valid url, for example `s3://bucket/a`, url scheme will be used, and the rest of the url will be ignored.
@@ -85,9 +98,31 @@ impl FileIO {
     /// # Arguments
     ///
     /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
+    #[deprecated(note = "use remove_dir_all instead", since = "0.4.0")]
     pub async fn remove_all(&self, path: impl AsRef<str>) -> Result<()> {
         let (op, relative_path) = self.inner.create_operator(&path)?;
         Ok(op.remove_all(relative_path).await?)
+    }
+
+    /// Remove the path and all nested dirs and files recursively.
+    ///
+    /// # Arguments
+    ///
+    /// * path: It should be *absolute* path starting with scheme string used to construct [`FileIO`].
+    ///
+    /// # Behavior
+    ///
+    /// - If the path is a file or not exist, this function will be no-op.
+    /// - If the path is a empty directory, this function will remove the directory itself.
+    /// - If the path is a non-empty directory, this function will remove the directory and all nested files and directories.
+    pub async fn remove_dir_all(&self, path: impl AsRef<str>) -> Result<()> {
+        let (op, relative_path) = self.inner.create_operator(&path)?;
+        let path = if relative_path.ends_with('/') {
+            relative_path.to_string()
+        } else {
+            format!("{relative_path}/")
+        };
+        Ok(op.remove_all(&path).await?)
     }
 
     /// Check file exists.
@@ -133,8 +168,33 @@ impl FileIO {
     }
 }
 
+/// Container for storing type-safe extensions used to configure underlying FileIO behavior.
+#[derive(Clone, Debug, Default)]
+pub struct Extensions(HashMap<TypeId, Arc<dyn Any + Send + Sync>>);
+
+impl Extensions {
+    /// Add an extension.
+    pub fn add<T: Any + Send + Sync>(&mut self, ext: T) {
+        self.0.insert(TypeId::of::<T>(), Arc::new(ext));
+    }
+
+    /// Extends the current set of extensions with another set of extensions.
+    pub fn extend(&mut self, extensions: Extensions) {
+        self.0.extend(extensions.0);
+    }
+
+    /// Fetch an extension.
+    pub fn get<T>(&self) -> Option<Arc<T>>
+    where T: 'static + Send + Sync + Clone {
+        let type_id = TypeId::of::<T>();
+        self.0
+            .get(&type_id)
+            .and_then(|arc_any| Arc::clone(arc_any).downcast::<T>().ok())
+    }
+}
+
 /// Builder for [`FileIO`].
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 pub struct FileIOBuilder {
     /// This is used to infer scheme of operator.
     ///
@@ -142,6 +202,8 @@ pub struct FileIOBuilder {
     scheme_str: Option<String>,
     /// Arguments for operator.
     props: HashMap<String, String>,
+    /// Optional extensions to configure the underlying FileIO behavior.
+    extensions: Extensions,
 }
 
 impl FileIOBuilder {
@@ -151,6 +213,7 @@ impl FileIOBuilder {
         Self {
             scheme_str: Some(scheme_str.to_string()),
             props: HashMap::default(),
+            extensions: Extensions::default(),
         }
     }
 
@@ -159,14 +222,19 @@ impl FileIOBuilder {
         Self {
             scheme_str: None,
             props: HashMap::default(),
+            extensions: Extensions::default(),
         }
     }
 
     /// Fetch the scheme string.
     ///
     /// The scheme_str will be empty if it's None.
-    pub(crate) fn into_parts(self) -> (String, HashMap<String, String>) {
-        (self.scheme_str.unwrap_or_default(), self.props)
+    pub fn into_parts(self) -> (String, HashMap<String, String>, Extensions) {
+        (
+            self.scheme_str.unwrap_or_default(),
+            self.props,
+            self.extensions,
+        )
     }
 
     /// Add argument for operator.
@@ -185,10 +253,29 @@ impl FileIOBuilder {
         self
     }
 
+    /// Add an extension to the file IO builder.
+    pub fn with_extension<T: Any + Send + Sync>(mut self, ext: T) -> Self {
+        self.extensions.add(ext);
+        self
+    }
+
+    /// Adds multiple extensions to the file IO builder.
+    pub fn with_extensions(mut self, extensions: Extensions) -> Self {
+        self.extensions.extend(extensions);
+        self
+    }
+
+    /// Fetch an extension from the file IO builder.
+    pub fn extension<T>(&self) -> Option<Arc<T>>
+    where T: 'static + Send + Sync + Clone {
+        self.extensions.get::<T>()
+    }
+
     /// Builds [`FileIO`].
-    pub fn build(self) -> crate::Result<FileIO> {
-        let storage = Storage::build(self)?;
+    pub fn build(self) -> Result<FileIO> {
+        let storage = Storage::build(self.clone())?;
         Ok(FileIO {
+            builder: self,
             inner: Arc::new(storage),
         })
     }
@@ -209,7 +296,7 @@ pub struct FileMetadata {
 /// It's possible for us to remove the async_trait, but we need to figure
 /// out how to handle the object safety.
 #[async_trait::async_trait]
-pub trait FileRead: Send + Unpin + 'static {
+pub trait FileRead: Send + Sync + Unpin + 'static {
     /// Read file content with given range.
     ///
     /// TODO: we can support reading non-contiguous bytes in the future.
@@ -255,7 +342,7 @@ impl InputFile {
 
     /// Read and returns whole content of file.
     ///
-    /// For continues reading, use [`Self::reader`] instead.
+    /// For continuous reading, use [`Self::reader`] instead.
     pub async fn read(&self) -> crate::Result<Bytes> {
         Ok(self
             .op
@@ -264,10 +351,10 @@ impl InputFile {
             .to_bytes())
     }
 
-    /// Creates [`FileRead`] for continues reading.
+    /// Creates [`FileRead`] for continuous reading.
     ///
     /// For one-time reading, use [`Self::read`] instead.
-    pub async fn reader(&self) -> crate::Result<impl FileRead> {
+    pub async fn reader(&self) -> crate::Result<impl FileRead + use<>> {
         Ok(self.op.reader(&self.path[self.relative_path_pos..]).await?)
     }
 }
@@ -298,7 +385,19 @@ impl FileWrite for opendal::Writer {
     }
 
     async fn close(&mut self) -> crate::Result<()> {
-        Ok(opendal::Writer::close(self).await?)
+        let _ = opendal::Writer::close(self).await?;
+        Ok(())
+    }
+}
+
+#[async_trait::async_trait]
+impl FileWrite for Box<dyn FileWrite> {
+    async fn write(&mut self, bs: Bytes) -> crate::Result<()> {
+        self.as_mut().write(bs).await
+    }
+
+    async fn close(&mut self) -> crate::Result<()> {
+        self.as_mut().close().await
     }
 }
 
@@ -319,8 +418,15 @@ impl OutputFile {
     }
 
     /// Checks if file exists.
-    pub async fn exists(&self) -> crate::Result<bool> {
+    pub async fn exists(&self) -> Result<bool> {
         Ok(self.op.exists(&self.path[self.relative_path_pos..]).await?)
+    }
+
+    /// Deletes file.
+    ///
+    /// If the file does not exist, it will not return error.
+    pub async fn delete(&self) -> Result<()> {
+        Ok(self.op.delete(&self.path[self.relative_path_pos..]).await?)
     }
 
     /// Converts into [`InputFile`].
@@ -337,14 +443,14 @@ impl OutputFile {
     /// # Notes
     ///
     /// Calling `write` will overwrite the file if it exists.
-    /// For continues writing, use [`Self::writer`].
+    /// For continuous writing, use [`Self::writer`].
     pub async fn write(&self, bs: Bytes) -> crate::Result<()> {
         let mut writer = self.writer().await?;
         writer.write(bs).await?;
         writer.close().await
     }
 
-    /// Creates output file for continues writing.
+    /// Creates output file for continuous writing.
     ///
     /// # Notes
     ///
@@ -358,13 +464,13 @@ impl OutputFile {
 
 #[cfg(test)]
 mod tests {
-    use std::fs::{create_dir_all, File};
+    use std::fs::{File, create_dir_all};
     use std::io::Write;
     use std::path::Path;
 
     use bytes::Bytes;
-    use futures::io::AllowStdIo;
     use futures::AsyncReadExt;
+    use futures::io::AllowStdIo;
     use tempfile::TempDir;
 
     use super::{FileIO, FileIOBuilder};
@@ -422,7 +528,15 @@ mod tests {
         let file_io = create_local_file_io();
         assert!(file_io.exists(&a_path).await.unwrap());
 
-        file_io.remove_all(&sub_dir_path).await.unwrap();
+        // Remove a file should be no-op.
+        file_io.remove_dir_all(&a_path).await.unwrap();
+        assert!(file_io.exists(&a_path).await.unwrap());
+
+        // Remove a not exist dir should be no-op.
+        file_io.remove_dir_all("not_exists/").await.unwrap();
+
+        // Remove a dir should remove all files in it.
+        file_io.remove_dir_all(&sub_dir_path).await.unwrap();
         assert!(!file_io.exists(&b_path).await.unwrap());
         assert!(!file_io.exists(&c_path).await.unwrap());
         assert!(file_io.exists(&a_path).await.unwrap());
@@ -441,7 +555,7 @@ mod tests {
         let file_io = create_local_file_io();
         assert!(!file_io.exists(&full_path).await.unwrap());
         assert!(file_io.delete(&full_path).await.is_ok());
-        assert!(file_io.remove_all(&full_path).await.is_ok());
+        assert!(file_io.remove_dir_all(&full_path).await.is_ok());
     }
 
     #[tokio::test]

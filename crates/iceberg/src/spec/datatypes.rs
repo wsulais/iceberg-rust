@@ -26,19 +26,21 @@ use std::sync::{Arc, OnceLock};
 
 use ::serde::de::{MapAccess, Visitor};
 use serde::de::{Error, IntoDeserializer};
-use serde::{de, Deserialize, Deserializer, Serialize, Serializer};
+use serde::{Deserialize, Deserializer, Serialize, Serializer, de};
 use serde_json::Value as JsonValue;
 
 use super::values::Literal;
 use crate::ensure_data_valid;
 use crate::error::Result;
-use crate::spec::datatypes::_decimal::{MAX_PRECISION, REQUIRED_LENGTH};
 use crate::spec::PrimitiveLiteral;
+use crate::spec::datatypes::_decimal::{MAX_PRECISION, REQUIRED_LENGTH};
 
 /// Field name for list type.
-pub(crate) const LIST_FILED_NAME: &str = "element";
-pub(crate) const MAP_KEY_FIELD_NAME: &str = "key";
-pub(crate) const MAP_VALUE_FIELD_NAME: &str = "value";
+pub const LIST_FIELD_NAME: &str = "element";
+/// Field name for map type's key.
+pub const MAP_KEY_FIELD_NAME: &str = "key";
+/// Field name for map type's value.
+pub const MAP_VALUE_FIELD_NAME: &str = "value";
 
 pub(crate) const MAX_DECIMAL_BYTES: u32 = 24;
 pub(crate) const MAX_DECIMAL_PRECISION: u32 = 38;
@@ -93,8 +95,8 @@ pub enum Type {
 impl fmt::Display for Type {
     fn fmt(&self, f: &mut fmt::Formatter) -> fmt::Result {
         match self {
-            Type::Primitive(primitive) => write!(f, "{}", primitive),
-            Type::Struct(s) => write!(f, "{}", s),
+            Type::Primitive(primitive) => write!(f, "{primitive}"),
+            Type::Struct(s) => write!(f, "{s}"),
             Type::List(_) => write!(f, "list"),
             Type::Map(_) => write!(f, "map"),
         }
@@ -151,14 +153,20 @@ impl Type {
     /// Returns minimum bytes required for decimal with [`precision`].
     #[inline(always)]
     pub fn decimal_required_bytes(precision: u32) -> Result<u32> {
-        ensure_data_valid!(precision > 0 && precision <= MAX_DECIMAL_PRECISION, "Decimals with precision larger than {MAX_DECIMAL_PRECISION} are not supported: {precision}",);
+        ensure_data_valid!(
+            precision > 0 && precision <= MAX_DECIMAL_PRECISION,
+            "Decimals with precision larger than {MAX_DECIMAL_PRECISION} are not supported: {precision}",
+        );
         Ok(REQUIRED_LENGTH[precision as usize - 1])
     }
 
     /// Creates  decimal type.
     #[inline(always)]
     pub fn decimal(precision: u32, scale: u32) -> Result<Self> {
-        ensure_data_valid!(precision > 0 && precision <= MAX_DECIMAL_PRECISION, "Decimals with precision larger than {MAX_DECIMAL_PRECISION} are not supported: {precision}",);
+        ensure_data_valid!(
+            precision > 0 && precision <= MAX_DECIMAL_PRECISION,
+            "Decimals with precision larger than {MAX_DECIMAL_PRECISION} are not supported: {precision}",
+        );
         Ok(Type::Primitive(PrimitiveType::Decimal { precision, scale }))
     }
 
@@ -226,8 +234,10 @@ pub enum PrimitiveType {
     /// Timestamp in microsecond precision, with timezone
     Timestamptz,
     /// Timestamp in nanosecond precision, without timezone
+    #[serde(rename = "timestamp_ns")]
     TimestampNs,
     /// Timestamp in nanosecond precision with timezone
+    #[serde(rename = "timestamptz_ns")]
     TimestamptzNs,
     /// Arbitrary-length character sequences encoded in utf-8
     String,
@@ -360,7 +370,7 @@ impl fmt::Display for PrimitiveType {
             PrimitiveType::Float => write!(f, "float"),
             PrimitiveType::Double => write!(f, "double"),
             PrimitiveType::Decimal { precision, scale } => {
-                write!(f, "decimal({},{})", precision, scale)
+                write!(f, "decimal({precision},{scale})")
             }
             PrimitiveType::Date => write!(f, "date"),
             PrimitiveType::Time => write!(f, "time"),
@@ -370,7 +380,7 @@ impl fmt::Display for PrimitiveType {
             PrimitiveType::TimestamptzNs => write!(f, "timestamptz_ns"),
             PrimitiveType::String => write!(f, "string"),
             PrimitiveType::Uuid => write!(f, "uuid"),
-            PrimitiveType::Fixed(size) => write!(f, "fixed({})", size),
+            PrimitiveType::Fixed(size) => write!(f, "fixed({size})"),
             PrimitiveType::Binary => write!(f, "binary"),
         }
     }
@@ -413,7 +423,15 @@ impl<'de> Deserialize<'de> for StructType {
                 let mut fields = None;
                 while let Some(key) = map.next_key()? {
                     match key {
-                        Field::Type => (),
+                        Field::Type => {
+                            let type_val: String = map.next_value()?;
+                            if type_val != "struct" {
+                                return Err(serde::de::Error::custom(format!(
+                                    "expected type 'struct', got '{}'",
+                                    type_val
+                                )));
+                            }
+                        }
                         Field::Fields => {
                             if fields.is_some() {
                                 return Err(serde::de::Error::duplicate_field("fields"));
@@ -604,37 +622,17 @@ impl NestedField {
 
     /// Construct a required field.
     pub fn required(id: i32, name: impl ToString, field_type: Type) -> Self {
-        Self {
-            id,
-            name: name.to_string(),
-            required: true,
-            field_type: Box::new(field_type),
-            doc: None,
-            initial_default: None,
-            write_default: None,
-        }
+        Self::new(id, name, field_type, true)
     }
 
     /// Construct an optional field.
     pub fn optional(id: i32, name: impl ToString, field_type: Type) -> Self {
-        Self {
-            id,
-            name: name.to_string(),
-            required: false,
-            field_type: Box::new(field_type),
-            doc: None,
-            initial_default: None,
-            write_default: None,
-        }
+        Self::new(id, name, field_type, false)
     }
 
     /// Construct list type's element field.
     pub fn list_element(id: i32, field_type: Type, required: bool) -> Self {
-        if required {
-            Self::required(id, LIST_FILED_NAME, field_type)
-        } else {
-            Self::optional(id, LIST_FILED_NAME, field_type)
-        }
+        Self::new(id, LIST_FIELD_NAME, field_type, required)
     }
 
     /// Construct map type's key field.
@@ -644,11 +642,7 @@ impl NestedField {
 
     /// Construct map type's value field.
     pub fn map_value_element(id: i32, field_type: Type, required: bool) -> Self {
-        if required {
-            Self::required(id, MAP_VALUE_FIELD_NAME, field_type)
-        } else {
-            Self::optional(id, MAP_VALUE_FIELD_NAME, field_type)
-        }
+        Self::new(id, MAP_VALUE_FIELD_NAME, field_type, required)
     }
 
     /// Set the field's doc.
@@ -687,7 +681,7 @@ impl fmt::Display for NestedField {
         }
         write!(f, "{} ", self.field_type)?;
         if let Some(doc) = &self.doc {
-            write!(f, "{}", doc)?;
+            write!(f, "{doc}")?;
         }
         Ok(())
     }
@@ -732,7 +726,7 @@ pub(super) mod _serde {
         },
         Struct {
             r#type: String,
-            fields: Cow<'a, Vec<NestedFieldRef>>,
+            fields: Cow<'a, [NestedFieldRef]>,
         },
         #[serde(rename_all = "kebab-case")]
         Map {
@@ -746,7 +740,7 @@ pub(super) mod _serde {
         Primitive(PrimitiveType),
     }
 
-    impl<'a> From<SerdeType<'a>> for Type {
+    impl From<SerdeType<'_>> for Type {
         fn from(value: SerdeType) -> Self {
             match value {
                 SerdeType::List {
@@ -855,64 +849,107 @@ mod tests {
     }
 
     #[test]
-    fn decimal() {
+    fn primitive_type_serde() {
         let record = r#"
-        {
-            "type": "struct",
-            "fields": [
-                {
-                    "id": 1,
-                    "name": "id",
-                    "required": true,
-                    "type": "decimal(9,2)"
-                }
-            ]
-        }
-        "#;
-
-        check_type_serde(
-            record,
-            Type::Struct(StructType {
-                fields: vec![NestedField::required(
-                    1,
-                    "id",
-                    Type::Primitive(PrimitiveType::Decimal {
-                        precision: 9,
-                        scale: 2,
-                    }),
-                )
-                .into()],
-                id_lookup: OnceLock::default(),
-                name_lookup: OnceLock::default(),
-            }),
-        )
+    {
+        "type": "struct",
+        "fields": [
+            {"id": 1, "name": "bool_field", "required": true, "type": "boolean"},
+            {"id": 2, "name": "int_field", "required": true, "type": "int"},
+            {"id": 3, "name": "long_field", "required": true, "type": "long"},
+            {"id": 4, "name": "float_field", "required": true, "type": "float"},
+            {"id": 5, "name": "double_field", "required": true, "type": "double"},
+            {"id": 6, "name": "decimal_field", "required": true, "type": "decimal(9,2)"},
+            {"id": 7, "name": "date_field", "required": true, "type": "date"},
+            {"id": 8, "name": "time_field", "required": true, "type": "time"},
+            {"id": 9, "name": "timestamp_field", "required": true, "type": "timestamp"},
+            {"id": 10, "name": "timestamptz_field", "required": true, "type": "timestamptz"},
+            {"id": 11, "name": "timestamp_ns_field", "required": true, "type": "timestamp_ns"},
+            {"id": 12, "name": "timestamptz_ns_field", "required": true, "type": "timestamptz_ns"},
+            {"id": 13, "name": "uuid_field", "required": true, "type": "uuid"},
+            {"id": 14, "name": "fixed_field", "required": true, "type": "fixed[10]"},
+            {"id": 15, "name": "binary_field", "required": true, "type": "binary"},
+            {"id": 16, "name": "string_field", "required": true, "type": "string"}
+        ]
     }
-
-    #[test]
-    fn fixed() {
-        let record = r#"
-        {
-            "type": "struct",
-            "fields": [
-                {
-                    "id": 1,
-                    "name": "id",
-                    "required": true,
-                    "type": "fixed[8]"
-                }
-            ]
-        }
-        "#;
+    "#;
 
         check_type_serde(
             record,
             Type::Struct(StructType {
-                fields: vec![NestedField::required(
-                    1,
-                    "id",
-                    Type::Primitive(PrimitiveType::Fixed(8)),
-                )
-                .into()],
+                fields: vec![
+                    NestedField::required(1, "bool_field", Type::Primitive(PrimitiveType::Boolean))
+                        .into(),
+                    NestedField::required(2, "int_field", Type::Primitive(PrimitiveType::Int))
+                        .into(),
+                    NestedField::required(3, "long_field", Type::Primitive(PrimitiveType::Long))
+                        .into(),
+                    NestedField::required(4, "float_field", Type::Primitive(PrimitiveType::Float))
+                        .into(),
+                    NestedField::required(
+                        5,
+                        "double_field",
+                        Type::Primitive(PrimitiveType::Double),
+                    )
+                    .into(),
+                    NestedField::required(
+                        6,
+                        "decimal_field",
+                        Type::Primitive(PrimitiveType::Decimal {
+                            precision: 9,
+                            scale: 2,
+                        }),
+                    )
+                    .into(),
+                    NestedField::required(7, "date_field", Type::Primitive(PrimitiveType::Date))
+                        .into(),
+                    NestedField::required(8, "time_field", Type::Primitive(PrimitiveType::Time))
+                        .into(),
+                    NestedField::required(
+                        9,
+                        "timestamp_field",
+                        Type::Primitive(PrimitiveType::Timestamp),
+                    )
+                    .into(),
+                    NestedField::required(
+                        10,
+                        "timestamptz_field",
+                        Type::Primitive(PrimitiveType::Timestamptz),
+                    )
+                    .into(),
+                    NestedField::required(
+                        11,
+                        "timestamp_ns_field",
+                        Type::Primitive(PrimitiveType::TimestampNs),
+                    )
+                    .into(),
+                    NestedField::required(
+                        12,
+                        "timestamptz_ns_field",
+                        Type::Primitive(PrimitiveType::TimestamptzNs),
+                    )
+                    .into(),
+                    NestedField::required(13, "uuid_field", Type::Primitive(PrimitiveType::Uuid))
+                        .into(),
+                    NestedField::required(
+                        14,
+                        "fixed_field",
+                        Type::Primitive(PrimitiveType::Fixed(10)),
+                    )
+                    .into(),
+                    NestedField::required(
+                        15,
+                        "binary_field",
+                        Type::Primitive(PrimitiveType::Binary),
+                    )
+                    .into(),
+                    NestedField::required(
+                        16,
+                        "string_field",
+                        Type::Primitive(PrimitiveType::String),
+                    )
+                    .into(),
+                ],
                 id_lookup: OnceLock::default(),
                 name_lookup: OnceLock::default(),
             }),
@@ -924,7 +961,7 @@ mod tests {
         let record = r#"
         {
             "type": "struct",
-            "fields": [ 
+            "fields": [
                 {
                     "id": 1,
                     "name": "id",
@@ -937,7 +974,7 @@ mod tests {
                     "name": "data",
                     "required": false,
                     "type": "int"
-                } 
+                }
             ]
         }
         "#;
@@ -1148,7 +1185,7 @@ mod tests {
     }
 
     #[test]
-    fn test_primitive_type_compatitable() {
+    fn test_primitive_type_compatible() {
         let pairs = vec![
             (PrimitiveType::Boolean, PrimitiveLiteral::Boolean(true)),
             (PrimitiveType::Int, PrimitiveLiteral::Int(1)),
@@ -1178,5 +1215,50 @@ mod tests {
         for (ty, literal) in pairs {
             assert!(ty.compatible(&literal));
         }
+    }
+
+    #[test]
+    fn struct_type_with_type_field() {
+        // Test that StructType properly deserializes JSON with "type":"struct" field
+        // This was previously broken because the deserializer wasn't consuming the type field value
+        let json = r#"
+        {
+            "type": "struct",
+            "fields": [
+                {"id": 1, "name": "field1", "required": true, "type": "string"}
+            ]
+        }
+        "#;
+
+        let struct_type: StructType = serde_json::from_str(json)
+            .expect("Should successfully deserialize StructType with type field");
+
+        assert_eq!(struct_type.fields().len(), 1);
+        assert_eq!(struct_type.fields()[0].name, "field1");
+    }
+
+    #[test]
+    fn struct_type_rejects_wrong_type() {
+        // Test that StructType validation rejects incorrect type field values
+        let json = r#"
+        {
+            "type": "list",
+            "fields": [
+                {"id": 1, "name": "field1", "required": true, "type": "string"}
+            ]
+        }
+        "#;
+
+        let result = serde_json::from_str::<StructType>(json);
+        assert!(
+            result.is_err(),
+            "Should reject StructType with wrong type field"
+        );
+        assert!(
+            result
+                .unwrap_err()
+                .to_string()
+                .contains("expected type 'struct'")
+        );
     }
 }

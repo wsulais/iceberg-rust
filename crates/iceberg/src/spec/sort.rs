@@ -147,7 +147,7 @@ impl SortOrderBuilder {
     /// Creates a new unbound sort order.
     pub fn build_unbound(&self) -> Result<SortOrder> {
         let fields = self.fields.clone().unwrap_or_default();
-        return match (self.order_id, fields.as_slice()) {
+        match (self.order_id, fields.as_slice()) {
             (Some(SortOrder::UNSORTED_ORDER_ID) | None, []) => Ok(SortOrder::unsorted_order()),
             (_, []) => Err(Error::new(
                 ErrorKind::Unexpected,
@@ -164,7 +164,7 @@ impl SortOrderBuilder {
                 order_id: maybe_order_id.unwrap_or(1),
                 fields: fields.to_vec(),
             }),
-        };
+        }
     }
 
     /// Creates a new bound sort order.
@@ -182,7 +182,7 @@ impl SortOrderBuilder {
                     return Err(Error::new(
                         ErrorKind::Unexpected,
                         format!("Cannot find source column for sort field: {sort_field}"),
-                    ))
+                    ));
                 }
                 Some(source_field) => {
                     let source_type = source_field.field_type.as_ref();
@@ -278,8 +278,8 @@ mod tests {
     }
 
     #[test]
-    fn test_build_unbound_should_return_err_if_order_id_equals_zero_is_used_for_anything_other_than_unsorted_order(
-    ) {
+    fn test_build_unbound_should_return_err_if_order_id_equals_zero_is_used_for_anything_other_than_unsorted_order()
+     {
         assert_eq!(
             SortOrder::builder()
                 .with_order_id(SortOrder::UNSORTED_ORDER_ID)
@@ -361,8 +361,8 @@ mod tests {
     }
 
     #[test]
-    fn test_build_unbound_should_return_sort_order_with_given_sort_fields_and_defaults_to_1_if_missing_an_order_id(
-    ) {
+    fn test_build_unbound_should_return_sort_order_with_given_sort_fields_and_defaults_to_1_if_missing_an_order_id()
+     {
         let sort_field = SortField::builder()
             .source_id(2)
             .direction(SortDirection::Ascending)
@@ -386,12 +386,9 @@ mod tests {
     fn test_build_should_return_err_if_sort_order_field_is_not_present_in_schema() {
         let schema = Schema::builder()
             .with_schema_id(1)
-            .with_fields(vec![NestedField::required(
-                1,
-                "foo",
-                Type::Primitive(PrimitiveType::Int),
-            )
-            .into()])
+            .with_fields(vec![
+                NestedField::required(1, "foo", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
             .build()
             .unwrap();
 
@@ -418,19 +415,21 @@ mod tests {
     fn test_build_should_return_err_if_source_field_is_not_a_primitive_type() {
         let schema = Schema::builder()
             .with_schema_id(1)
-            .with_fields(vec![NestedField::required(
-                1,
-                "foo",
-                Type::List(ListType {
-                    element_field: NestedField::list_element(
-                        2,
-                        Type::Primitive(PrimitiveType::String),
-                        true,
-                    )
-                    .into(),
-                }),
-            )
-            .into()])
+            .with_fields(vec![
+                NestedField::required(
+                    1,
+                    "foo",
+                    Type::List(ListType {
+                        element_field: NestedField::list_element(
+                            2,
+                            Type::Primitive(PrimitiveType::String),
+                            true,
+                        )
+                        .into(),
+                    }),
+                )
+                .into(),
+            ])
             .build()
             .unwrap();
 
@@ -457,12 +456,9 @@ mod tests {
     fn test_build_should_return_err_if_source_field_type_is_not_supported_by_transform() {
         let schema = Schema::builder()
             .with_schema_id(1)
-            .with_fields(vec![NestedField::required(
-                1,
-                "foo",
-                Type::Primitive(PrimitiveType::Int),
-            )
-            .into()])
+            .with_fields(vec![
+                NestedField::required(1, "foo", Type::Primitive(PrimitiveType::Int)).into(),
+            ])
             .build()
             .unwrap();
 

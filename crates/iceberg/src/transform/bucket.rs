@@ -167,6 +167,16 @@ impl TransformFunction for Bucket {
                 .downcast_ref::<arrow_array::TimestampMicrosecondArray>()
                 .unwrap()
                 .unary(|v| self.bucket_timestamp(v)),
+            DataType::Time64(TimeUnit::Nanosecond) => input
+                .as_any()
+                .downcast_ref::<arrow_array::Time64NanosecondArray>()
+                .unwrap()
+                .unary(|v| self.bucket_time(v / 1000)),
+            DataType::Timestamp(TimeUnit::Nanosecond, _) => input
+                .as_any()
+                .downcast_ref::<arrow_array::TimestampNanosecondArray>()
+                .unwrap()
+                .unary(|v| self.bucket_timestamp(v / 1000)),
             DataType::Utf8 => arrow_array::Int32Array::from_iter(
                 input
                     .as_any()
@@ -214,7 +224,7 @@ impl TransformFunction for Bucket {
                         "Unsupported data type for bucket transform: {:?}",
                         input.data_type()
                     ),
-                ))
+                ));
             }
         };
         Ok(Arc::new(res))
@@ -228,6 +238,13 @@ impl TransformFunction for Bucket {
             (PrimitiveType::Date, PrimitiveLiteral::Int(v)) => self.bucket_date(*v),
             (PrimitiveType::Time, PrimitiveLiteral::Long(v)) => self.bucket_time(*v),
             (PrimitiveType::Timestamp, PrimitiveLiteral::Long(v)) => self.bucket_timestamp(*v),
+            (PrimitiveType::Timestamptz, PrimitiveLiteral::Long(v)) => self.bucket_timestamp(*v),
+            (PrimitiveType::TimestampNs, PrimitiveLiteral::Long(v)) => {
+                self.bucket_timestamp(*v / 1000)
+            }
+            (PrimitiveType::TimestamptzNs, PrimitiveLiteral::Long(v)) => {
+                self.bucket_timestamp(*v / 1000)
+            }
             (PrimitiveType::String, PrimitiveLiteral::String(v)) => self.bucket_str(v.as_str()),
             (PrimitiveType::Uuid, PrimitiveLiteral::UInt128(v)) => {
                 self.bucket_bytes(uuid::Uuid::from_u128(*v).as_ref())
@@ -241,7 +258,7 @@ impl TransformFunction for Bucket {
                         "Unsupported data type for bucket transform: {:?}",
                         input.data_type()
                     ),
-                ))
+                ));
             }
         };
         Ok(Some(Datum::int(val)))
@@ -250,9 +267,13 @@ impl TransformFunction for Bucket {
 
 #[cfg(test)]
 mod test {
+    use std::sync::Arc;
+
+    use arrow_array::{ArrayRef, Int32Array, TimestampMicrosecondArray, TimestampNanosecondArray};
     use chrono::{DateTime, NaiveDate, NaiveDateTime, NaiveTime};
 
     use super::Bucket;
+    use crate::Result;
     use crate::expr::PredicateOperator;
     use crate::spec::PrimitiveType::{
         Binary, Date, Decimal, Fixed, Int, Long, String as StringType, Time, Timestamp,
@@ -260,9 +281,8 @@ mod test {
     };
     use crate::spec::Type::{Primitive, Struct};
     use crate::spec::{Datum, NestedField, PrimitiveType, StructType, Transform, Type};
-    use crate::transform::test::{TestProjectionFixture, TestTransformFixture};
     use crate::transform::TransformFunction;
-    use crate::Result;
+    use crate::transform::test::{TestProjectionFixture, TestTransformFixture};
 
     #[test]
     fn test_bucket_transform() {
@@ -300,12 +320,9 @@ mod test {
                 (Primitive(TimestampNs), Some(Primitive(Int))),
                 (Primitive(TimestamptzNs), Some(Primitive(Int))),
                 (
-                    Struct(StructType::new(vec![NestedField::optional(
-                        1,
-                        "a",
-                        Primitive(Timestamp),
-                    )
-                    .into()])),
+                    Struct(StructType::new(vec![
+                        NestedField::optional(1, "a", Primitive(Timestamp)).into(),
+                    ])),
                     None,
                 ),
             ],
@@ -887,5 +904,67 @@ mod test {
                 .unwrap(),
             Datum::int(32)
         );
+    }
+
+    #[test]
+    fn test_timestamptz_literal() {
+        let bucket = Bucket::new(100);
+        assert_eq!(
+            bucket
+                .transform_literal(&Datum::timestamptz_micros(1510871468000000))
+                .unwrap()
+                .unwrap(),
+            Datum::int(7)
+        );
+    }
+
+    #[test]
+    fn test_timestamp_ns_literal() {
+        let bucket = Bucket::new(100);
+        let ns_value = 1510871468000000i64 * 1000;
+        assert_eq!(
+            bucket
+                .transform_literal(&Datum::timestamp_nanos(ns_value))
+                .unwrap()
+                .unwrap(),
+            Datum::int(7)
+        );
+    }
+
+    #[test]
+    fn test_timestamptz_ns_literal() {
+        let bucket = Bucket::new(100);
+        let ns_value = 1510871468000000i64 * 1000;
+        assert_eq!(
+            bucket
+                .transform_literal(&Datum::timestamptz_nanos(ns_value))
+                .unwrap()
+                .unwrap(),
+            Datum::int(7)
+        );
+    }
+
+    #[test]
+    fn test_transform_timestamp_nanos_and_micros_array_equivalence() {
+        let bucket = Bucket::new(100);
+        let micros_value = 1510871468000000;
+        let nanos_value = micros_value * 1000;
+
+        let micro_array = TimestampMicrosecondArray::from_iter_values(vec![micros_value]);
+        let nano_array = TimestampNanosecondArray::from_iter_values(vec![nanos_value]);
+
+        let transformed_micro: ArrayRef = bucket.transform(Arc::new(micro_array)).unwrap();
+        let transformed_nano: ArrayRef = bucket.transform(Arc::new(nano_array)).unwrap();
+
+        let micro_result = transformed_micro
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+        let nano_result = transformed_nano
+            .as_any()
+            .downcast_ref::<Int32Array>()
+            .unwrap();
+
+        assert_eq!(micro_result.value(0), nano_result.value(0));
     }
 }

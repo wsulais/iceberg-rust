@@ -22,15 +22,26 @@ on:
     branches:
       - main
   pull_request:
-    branches:
-      - main
+    paths:
+      - '**'                              # Include all files and directories in the repository by default.
+      - '!.github/ISSUE_TEMPLATE/**'      # Exclude files and directories that don't impact tests or code like templates, metadata, and documentation.
+      - '!scripts/**'
+      - '!website/**'
+      - '!.asf.yml'
+      - '!.gitattributes'
+      - '!.gitignore'
+      - '!CONTRIBUTING.md'
+      - '!CHANGELOG.md'
+      - '!LICENSE'
+      - '!NOTICE'
+      - '!README.md'
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}-${{ github.event_name }}
   cancel-in-progress: true
 
 env:
-  rust_msrv: "1.77.1"
+  rust_msrv: "1.87"
 
 jobs:
   check:
@@ -41,16 +52,21 @@ jobs:
           - ubuntu-latest
           - macos-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-builder
 
       - name: Check License Header
-        uses: apache/skywalking-eyes/header@v0.6.0
+        uses: apache/skywalking-eyes/header@v0.8.0
 
-      - name: Install cargo-sort
-        run: make install-cargo-sort
+      - name: Check toml format
+        run: make check-toml
 
-      - name: Install taplo-cli
-        run: make install-taplo-cli
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Cargo format
         run: make check-fmt
@@ -60,9 +76,6 @@ jobs:
 
       - name: Cargo clippy
         run: make check-clippy
-
-      - name: Cargo sort
-        run: make cargo-sort
 
       - name: Cargo Machete
         run: make cargo-machete
@@ -76,12 +89,30 @@ jobs:
           - macos-latest
           - windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Maximize build space (Ubuntu)
+        if: matrix.os == 'ubuntu-latest'
+        uses: easimon/maximize-build-space@master
+        with:
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
+          root-reserve-mb: 10240
+          temp-reserve-mb: 10240
+
+      - uses: actions/checkout@v5
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
         with:
-          rust-version: ${{ env.rust_msrv }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build
         run: make build
@@ -95,25 +126,67 @@ jobs:
           - macos-latest
           - windows-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
+
+      - name: Setup Rust toolchain
+        uses: ./.github/actions/setup-builder
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
+
       - name: Build
         run: cargo build -p iceberg --no-default-features
 
   unit:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Maximize build space
+        uses: easimon/maximize-build-space@master
+        with:
+          remove-dotnet: "true"
+          remove-android: "true"
+          remove-haskell: "true"
+          remove-codeql: "true"
+          remove-docker-images: "true"
+          root-reserve-mb: 10240
+          temp-reserve-mb: 10240
+
+      - uses: actions/checkout@v5
 
       - name: Setup Rust toolchain
         uses: ./.github/actions/setup-builder
+
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
         with:
-          rust-version: ${{ env.rust_msrv }}
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Cache Rust artifacts
+        uses: Swatinem/rust-cache@v2
 
       - name: Test
         run: cargo test --no-fail-fast --all-targets --all-features --workspace
 
-      - name: Async-std Test
-        run: cargo test --no-fail-fast --all-targets --no-default-features  --features "async-std" --features "storage-all" --workspace
+      - name: Smol Test
+        run: cargo test --no-fail-fast --all-targets --no-default-features --features "smol" --features "storage-all" --workspace
 
       - name: Doc Test
         run: cargo test --no-fail-fast --doc --all-features --workspace
+
+  msrv:
+    name: Verify MSRV
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+      - name: Install protoc
+        uses: arduino/setup-protoc@v3
+        with:
+          repo-token: ${{ secrets.GITHUB_TOKEN }}
+      - name: Setup MSRV Rust toolchain
+        uses: ./.github/actions/setup-builder
+        with:
+          rust-version: ${{ env.rust_msrv }}
+      - name: Setup Nightly Rust toolchain
+        uses: ./.github/actions/setup-builder
+      - name: Check MSRV
+        run: make check-msrv

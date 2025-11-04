@@ -26,20 +26,14 @@ check-fmt:
 check-clippy:
 	cargo  clippy --all-targets --all-features --workspace -- -D warnings
 
-install-cargo-sort:
-	cargo install cargo-sort@1.0.9
-
-cargo-sort: install-cargo-sort
-	cargo sort -c -w
-
 install-cargo-machete:
-	cargo install cargo-machete
+	cargo install cargo-machete@0.7.0
 
 cargo-machete: install-cargo-machete
 	cargo machete
 
 install-taplo-cli:
-	cargo install taplo-cli@0.9.0
+	cargo install taplo-cli@0.9.3
 
 fix-toml: install-taplo-cli
 	taplo fmt
@@ -47,7 +41,13 @@ fix-toml: install-taplo-cli
 check-toml: install-taplo-cli
 	taplo check
 
-check: check-fmt check-clippy cargo-sort check-toml cargo-machete
+NIGHTLY_VERSION := $(shell awk -F'"' '/^channel/ {print $$2}' rust-toolchain.toml)
+MSRV_VERSION    := $(shell awk -F'"' '/^rust-version/ {print $$2}' Cargo.toml)
+
+check-msrv:
+	cargo +$(MSRV_VERSION) check --workspace
+
+check: check-fmt check-clippy check-toml cargo-machete
 
 doc-test:
 	cargo test --no-fail-fast --doc --all-features --workspace
