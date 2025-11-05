@@ -768,7 +768,7 @@ mod tests {
             ]),
             key_metadata: None,
             split_offsets: vec![4],
-            equality_ids: vec![],
+            equality_ids: None,
             sort_order_id: Some(0),
             partition_spec_id: 0,
             first_row_id: None,
@@ -800,7 +800,7 @@ mod tests {
             ]),
             key_metadata: None,
             split_offsets: vec![4],
-            equality_ids: vec![],
+            equality_ids: None,
             sort_order_id: Some(0),
             partition_spec_id: 0,
             first_row_id: None,
@@ -819,14 +819,14 @@ mod tests {
         assert_eq!(props.get(ADDED_FILE_SIZE).unwrap(), "300");
         assert_eq!(props.get(REMOVED_FILE_SIZE).unwrap(), "100");
 
-        let partition_key = format!("{}{}", CHANGED_PARTITION_PREFIX, "year=\"2025\"");
+        let partition_key = format!("{}{}", CHANGED_PARTITION_PREFIX, "year=2025");
 
         assert!(props.contains_key(&partition_key));
 
         let partition_summary = props.get(&partition_key).unwrap();
-        assert!(partition_summary.contains(&format!("{}=200", ADDED_FILE_SIZE)));
-        assert!(partition_summary.contains(&format!("{}=1", ADDED_DATA_FILES)));
-        assert!(partition_summary.contains(&format!("{}=20", ADDED_RECORDS)));
+        assert!(partition_summary.contains(&format!("{ADDED_FILE_SIZE}=200")));
+        assert!(partition_summary.contains(&format!("{ADDED_DATA_FILES}=1")));
+        assert!(partition_summary.contains(&format!("{ADDED_RECORDS}=20")));
     }
 
     #[test]
@@ -910,7 +910,7 @@ mod tests {
                 upper_bounds: HashMap::new(),
                 key_metadata: None,
                 split_offsets: vec![],
-                equality_ids: vec![],
+                equality_ids: None,
                 sort_order_id: None,
                 partition_spec_id: 0,
                 first_row_id: None,
@@ -938,7 +938,7 @@ mod tests {
                 upper_bounds: HashMap::new(),
                 key_metadata: None,
                 split_offsets: vec![],
-                equality_ids: vec![],
+                equality_ids: None,
                 sort_order_id: None,
                 partition_spec_id: 0,
                 first_row_id: None,
@@ -992,7 +992,7 @@ mod tests {
                 upper_bounds: HashMap::new(),
                 key_metadata: None,
                 split_offsets: vec![],
-                equality_ids: vec![],
+                equality_ids: None,
                 sort_order_id: None,
                 partition_spec_id: 0,
                 first_row_id: None,

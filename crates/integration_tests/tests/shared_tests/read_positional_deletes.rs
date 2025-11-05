@@ -18,15 +18,18 @@
 //! Integration tests for rest catalog.
 
 use futures::TryStreamExt;
-use iceberg::{Catalog, TableIdent};
-use iceberg_catalog_rest::RestCatalog;
+use iceberg::{Catalog, CatalogBuilder, TableIdent};
+use iceberg_catalog_rest::RestCatalogBuilder;
 
 use crate::get_shared_containers;
 
 #[tokio::test]
 async fn test_read_table_with_positional_deletes() {
     let fixture = get_shared_containers();
-    let rest_catalog = RestCatalog::new(fixture.catalog_config.clone());
+    let rest_catalog = RestCatalogBuilder::default()
+        .load("rest", fixture.catalog_config.clone())
+        .await
+        .unwrap();
 
     let table = rest_catalog
         .load_table(
@@ -37,7 +40,7 @@ async fn test_read_table_with_positional_deletes() {
         .unwrap();
 
     let scan = table.scan().build().unwrap();
-    println!("{:?}", scan);
+    println!("{scan:?}");
 
     let plan: Vec<_> = scan
         .plan_files()
@@ -46,11 +49,11 @@ async fn test_read_table_with_positional_deletes() {
         .try_collect()
         .await
         .unwrap();
-    println!("{:?}", plan);
+    println!("{plan:?}");
 
     // Scan plan phase should include delete files in file plan
     // when with_delete_file_processing_enabled == true
-    assert_eq!(plan[0].deletes.len(), 2);
+    assert_eq!(plan[0].deletes.len(), 1);
 
     // we should see two rows deleted, returning 10 rows instead of 12
     let batch_stream = scan.to_arrow().await.unwrap();

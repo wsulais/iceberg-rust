@@ -27,9 +27,10 @@ use iceberg::writer::file_writer::ParquetWriterBuilder;
 use iceberg::writer::file_writer::location_generator::{
     DefaultFileNameGenerator, DefaultLocationGenerator,
 };
+use iceberg::writer::file_writer::rolling_writer::RollingFileWriterBuilder;
 use iceberg::writer::{IcebergWriter, IcebergWriterBuilder};
-use iceberg::{Catalog, TableCreation};
-use iceberg_catalog_rest::RestCatalog;
+use iceberg::{Catalog, CatalogBuilder, TableCreation};
+use iceberg_catalog_rest::RestCatalogBuilder;
 use parquet::file::properties::WriterProperties;
 
 use crate::get_shared_containers;
@@ -38,7 +39,10 @@ use crate::shared_tests::{random_ns, test_schema};
 #[tokio::test]
 async fn test_append_data_file_conflict() {
     let fixture = get_shared_containers();
-    let rest_catalog = RestCatalog::new(fixture.catalog_config.clone());
+    let rest_catalog = RestCatalogBuilder::default()
+        .load("rest", fixture.catalog_config.clone())
+        .await
+        .unwrap();
     let ns = random_ns().await;
     let schema = test_schema();
 
@@ -70,12 +74,15 @@ async fn test_append_data_file_conflict() {
     let parquet_writer_builder = ParquetWriterBuilder::new(
         WriterProperties::default(),
         table.metadata().current_schema().clone(),
+    );
+    let rolling_file_writer_builder = RollingFileWriterBuilder::new_with_default_file_size(
+        parquet_writer_builder,
         table.file_io().clone(),
         location_generator.clone(),
         file_name_generator.clone(),
     );
-    let data_file_writer_builder = DataFileWriterBuilder::new(parquet_writer_builder, None, 0);
-    let mut data_file_writer = data_file_writer_builder.build().await.unwrap();
+    let data_file_writer_builder = DataFileWriterBuilder::new(rolling_file_writer_builder);
+    let mut data_file_writer = data_file_writer_builder.build(None).await.unwrap();
     let col1 = StringArray::from(vec![Some("foo"), Some("bar"), None, Some("baz")]);
     let col2 = Int32Array::from(vec![Some(1), Some(2), Some(3), Some(4)]);
     let col3 = BooleanArray::from(vec![Some(true), Some(false), None, Some(false)]);

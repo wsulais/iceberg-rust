@@ -579,7 +579,7 @@ mod test {
             column_sizes: Default::default(),
             key_metadata: None,
             split_offsets: vec![],
-            equality_ids: vec![],
+            equality_ids: None,
             sort_order_id: None,
             partition_spec_id: 0,
             first_row_id: None,
@@ -605,7 +605,7 @@ mod test {
             upper_bounds: Default::default(),
             key_metadata: None,
             split_offsets: vec![],
-            equality_ids: vec![],
+            equality_ids: None,
             sort_order_id: None,
             partition_spec_id: 0,
             first_row_id: None,
@@ -631,7 +631,7 @@ mod test {
             column_sizes: Default::default(),
             key_metadata: None,
             split_offsets: vec![],
-            equality_ids: vec![],
+            equality_ids: None,
             sort_order_id: None,
             partition_spec_id: 0,
             first_row_id: None,
@@ -658,7 +658,7 @@ mod test {
             column_sizes: Default::default(),
             key_metadata: None,
             split_offsets: vec![],
-            equality_ids: vec![],
+            equality_ids: None,
             sort_order_id: None,
             partition_spec_id: 0,
             first_row_id: None,
@@ -1045,8 +1045,7 @@ mod test {
             // For zero-record files, strict eval returns MUST_MATCH.
             assert!(
                 result,
-                "Strict eval: Should read zero-record file for expression {:?}",
-                expr
+                "Strict eval: Should read zero-record file for expression {expr:?}"
             );
         }
     }
@@ -1142,11 +1141,7 @@ mod test {
 
         let result =
             StrictMetricsEvaluator::eval(&less_than_int("id", INT_MIN_VALUE), &file).unwrap();
-        assert!(
-            !result,
-            "Strict eval: id < {} should be false",
-            INT_MIN_VALUE
-        );
+        assert!(!result, "Strict eval: id < {INT_MIN_VALUE} should be false");
 
         let result =
             StrictMetricsEvaluator::eval(&less_than_int("id", INT_MIN_VALUE + 1), &file).unwrap();
@@ -1158,11 +1153,7 @@ mod test {
 
         let result =
             StrictMetricsEvaluator::eval(&less_than_int("id", INT_MAX_VALUE), &file).unwrap();
-        assert!(
-            !result,
-            "Strict eval: id < {} should be false",
-            INT_MAX_VALUE
-        );
+        assert!(!result, "Strict eval: id < {INT_MAX_VALUE} should be false");
 
         let result =
             StrictMetricsEvaluator::eval(&less_than_int("id", INT_MAX_VALUE + 1), &file).unwrap();
@@ -1200,18 +1191,13 @@ mod test {
                 .unwrap();
         assert!(
             !result,
-            "Strict eval: id <= {} should be false",
-            INT_MIN_VALUE
+            "Strict eval: id <= {INT_MIN_VALUE} should be false"
         );
 
         let result =
             StrictMetricsEvaluator::eval(&less_than_or_equal_int("id", INT_MAX_VALUE), &file)
                 .unwrap();
-        assert!(
-            result,
-            "Strict eval: id <= {} should be true",
-            INT_MAX_VALUE
-        );
+        assert!(result, "Strict eval: id <= {INT_MAX_VALUE} should be true");
 
         let result =
             StrictMetricsEvaluator::eval(&less_than_or_equal_int("id", INT_MAX_VALUE + 1), &file)
@@ -1238,19 +1224,11 @@ mod test {
 
         let result =
             StrictMetricsEvaluator::eval(&greater_than_int("id", INT_MAX_VALUE), &file).unwrap();
-        assert!(
-            !result,
-            "Strict eval: id > {} should be false",
-            INT_MAX_VALUE
-        );
+        assert!(!result, "Strict eval: id > {INT_MAX_VALUE} should be false");
 
         let result =
             StrictMetricsEvaluator::eval(&greater_than_int("id", INT_MIN_VALUE), &file).unwrap();
-        assert!(
-            !result,
-            "Strict eval: id > {} should be false",
-            INT_MIN_VALUE
-        );
+        assert!(!result, "Strict eval: id > {INT_MIN_VALUE} should be false");
 
         let result =
             StrictMetricsEvaluator::eval(&greater_than_int("id", INT_MIN_VALUE - 1), &file)
@@ -1302,18 +1280,13 @@ mod test {
                 .unwrap();
         assert!(
             !result,
-            "Strict eval: id >= {} should be false",
-            INT_MAX_VALUE
+            "Strict eval: id >= {INT_MAX_VALUE} should be false"
         );
 
         let result =
             StrictMetricsEvaluator::eval(&greater_than_or_equal_int("id", INT_MIN_VALUE), &file)
                 .unwrap();
-        assert!(
-            result,
-            "Strict eval: id >= {} should be true",
-            INT_MIN_VALUE
-        );
+        assert!(result, "Strict eval: id >= {INT_MIN_VALUE} should be true");
 
         let result = StrictMetricsEvaluator::eval(
             &greater_than_or_equal_int("id", INT_MIN_VALUE - 1),
