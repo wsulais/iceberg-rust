@@ -44,6 +44,9 @@ pub struct MergeAppendAction {
     key_metadata: Option<Vec<u8>>,
     snapshot_properties: HashMap<String, String>,
     added_data_files: Vec<DataFile>,
+    added_delete_files: Vec<DataFile>,
+    deleted_data_files: Vec<DataFile>,
+    deleted_delete_files: Vec<DataFile>,
 }
 
 /// Target size of manifest file when merging manifests.
@@ -82,6 +85,9 @@ impl MergeAppendAction {
             key_metadata: None,
             snapshot_properties: HashMap::default(),
             added_data_files: vec![],
+            added_delete_files: vec![],
+            deleted_data_files: vec![],
+            deleted_delete_files: vec![],
         })
     }
 
@@ -110,6 +116,21 @@ impl MergeAppendAction {
         self.added_data_files.extend(data_files);
         self
     }
+
+    pub fn add_delete_files(mut self, data_files: impl IntoIterator<Item = DataFile>) -> Self {
+        self.added_data_files.extend(data_files);
+        self
+    }
+
+    pub fn delete_data_files(mut self, data_files: impl IntoIterator<Item = DataFile>) -> Self {
+        self.deleted_data_files.extend(data_files);
+        self
+    }
+
+    pub fn delete_delete_files(mut self, data_files: impl IntoIterator<Item = DataFile>) -> Self {
+        self.deleted_data_files.extend(data_files);
+        self
+    }
 }
 
 #[async_trait]
@@ -121,6 +142,9 @@ impl TransactionAction for MergeAppendAction {
             self.key_metadata.clone(),
             self.snapshot_properties.clone(),
             self.added_data_files.clone(),
+            self.added_delete_files.clone(),
+            self.deleted_data_files.clone(),
+            self.deleted_delete_files.clone(),
         );
 
         // validate added files
@@ -135,10 +159,13 @@ impl TransactionAction for MergeAppendAction {
 
         if self.merge_enabled {
             snapshot_producer
-                .commit(AppendOperation, MergeManifestProcess {
-                    target_size_bytes: self.target_size_bytes,
-                    min_count_to_merge: self.min_count_to_merge,
-                })
+                .commit(
+                    AppendOperation,
+                    MergeManifestProcess {
+                        target_size_bytes: self.target_size_bytes,
+                        min_count_to_merge: self.min_count_to_merge,
+                    },
+                )
                 .await
         } else {
             snapshot_producer
@@ -243,7 +270,10 @@ impl MergeManifestManager {
                             Box<dyn Future<Output = Result<Vec<ManifestFile>>> + Send>,
                         >)
                 } else {
-                    let writer = snapshot_produce.new_manifest_writer(self.content)?;
+                    let writer = snapshot_produce.new_manifest_writer(
+                        self.content,
+                        snapshot_produce.table.metadata().last_partition_id
+                    )?;
                     let snapshot_id = snapshot_produce.snapshot_id;
                     let file_io = snapshot_produce.table.file_io().clone();
                     Ok((Box::pin(async move {
